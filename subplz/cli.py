@@ -282,6 +282,14 @@ ARGUMENTS = {
             "action": "store_true",
         },
     },
+    "mlx": {
+        "flags": ["--mlx"],
+        "kwargs": {
+            "default": False,
+            "help": "Use mlx-whisper (Apple Metal + Neural Engine). Recommended on macOS Apple Silicon — much faster than faster-whisper on CPU.",
+            "action": "store_true",
+        },
+    },
     "local_only": {
         "flags": ["--local-only"],
         "kwargs": {
@@ -535,6 +543,7 @@ class SyncParams:
     model_name: str = field(metadata={"category": "optional"})
     # Faster Whisper
     faster_whisper: bool = field(metadata={"category": "optional"})
+    mlx: bool = field(metadata={"category": "optional"})
     local_only: bool = field(metadata={"category": "optional"})
     # stable-ts
     stable_ts: bool = field(metadata={"category": "optional"})
@@ -625,6 +634,7 @@ class GenParams:
     model_name: str = field(metadata={"category": "optional"})
     # Faster Whisper
     faster_whisper: bool = field(metadata={"category": "optional"})
+    mlx: bool = field(metadata={"category": "optional"})
     local_only: bool = field(metadata={"category": "optional"})
     # stable-ts
     stable_ts: bool = field(metadata={"category": "optional"})

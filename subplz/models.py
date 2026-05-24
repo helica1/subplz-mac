@@ -87,6 +87,94 @@ def get_temperature(inputs):
     return temperature
 
 
+MLX_MODEL_ALIASES = {
+    "tiny": "mlx-community/whisper-tiny",
+    "tiny.en": "mlx-community/whisper-tiny.en",
+    "base": "mlx-community/whisper-base",
+    "base.en": "mlx-community/whisper-base.en",
+    "small": "mlx-community/whisper-small",
+    "small.en": "mlx-community/whisper-small.en",
+    "medium": "mlx-community/whisper-medium",
+    "medium.en": "mlx-community/whisper-medium.en",
+    "large": "mlx-community/whisper-large-v3-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+# kwargs that mlx_whisper.transcribe accepts. Anything else from the subplz
+# CLI is dropped silently. (faster-whisper exposes more knobs than MLX does.)
+_MLX_SUPPORTED_KWARGS = frozenset(
+    {
+        "language",
+        "initial_prompt",
+        "temperature",
+        "compression_ratio_threshold",
+        "logprob_threshold",
+        "no_speech_threshold",
+        "condition_on_previous_text",
+        "word_timestamps",
+        "prepend_punctuations",
+        "append_punctuations",
+    }
+)
+
+
+class MLXWhisperBackend:
+    """Apple Silicon Metal + Neural Engine backend.
+
+    Wraps `mlx_whisper.transcribe()` to match the `faster_transcribe(audio,
+    name, **kwargs)` contract that subplz/files.py:AudioSub.transcribe expects.
+    MLX caches the loaded model internally across calls keyed on the repo path,
+    so sequential chapter transcriptions reuse the loaded weights.
+    """
+
+    def __init__(self, model_repo: str):
+        self.model_repo = model_repo
+        # Eagerly resolve to give the user a clear error early on a typo'd repo.
+        import mlx_whisper  # noqa: F401  (defer heavyweight import to call time)
+
+        logger.info(f"🧠 MLX-Whisper backend: model='{model_repo}'")
+
+    def faster_transcribe(self, audio, name, **kwargs):
+        import mlx_whisper
+
+        # Strip kwargs MLX doesn't understand; map a few names through.
+        mlx_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k in _MLX_SUPPORTED_KWARGS and v is not None
+        }
+        # MLX requires temperature to be a float or tuple of floats; subplz
+        # may pass a list/tuple already from get_temperature(). Normalize.
+        if "temperature" in mlx_kwargs:
+            t = mlx_kwargs["temperature"]
+            if not isinstance(t, (int, float)):
+                mlx_kwargs["temperature"] = tuple(float(x) for x in t)
+
+        logger.info(f"📝 MLX transcribe: {name}")
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=self.model_repo,
+            verbose=None,
+            **mlx_kwargs,
+        )
+
+        # Reshape to the contract subplz expects: only {start, end, text} per
+        # segment. mlx_whisper segments also include `id`, `tokens`,
+        # `avg_logprob`, etc. — extra fields are harmless but we trim to keep
+        # the cache file small and match the existing pipeline shape.
+        segments = [
+            {"start": float(s["start"]), "end": float(s["end"]), "text": s["text"]}
+            for s in result.get("segments", [])
+        ]
+        return {
+            "segments": segments,
+            "language": result.get("language", kwargs.get("language") or "en"),
+        }
+
+
 def get_model(backend):
     model_name = backend.model_name
     device = backend.device
@@ -95,6 +183,24 @@ def get_model(backend):
     local_files_only = backend.local_only
     quantize = backend.quantize
     num_workers = backend.threads
+    # MLX is opt-in via --mlx; on Apple Silicon it's the fastest option since
+    # faster-whisper/CTranslate2 has no Metal backend.
+    use_mlx = getattr(backend, "mlx", False)
+
+    if use_mlx:
+        # Map short aliases like "turbo" → an mlx-community HF repo.
+        # If the user passed a full repo path with "/", trust it as-is.
+        if "/" in model_name:
+            model_repo = model_name
+        else:
+            model_repo = MLX_MODEL_ALIASES.get(model_name, model_name)
+            if model_repo == model_name and model_name not in MLX_MODEL_ALIASES:
+                logger.warning(
+                    f"⚠️  '{model_name}' not in MLX alias table; will try as HF repo. "
+                    f"Known: {sorted(MLX_MODEL_ALIASES.keys())}"
+                )
+        return MLXWhisperBackend(model_repo)
+
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
     logger.info(
