@@ -1,3 +1,5 @@
+import platform
+import shutil
 import subprocess
 from pathlib import Path
 from subplz.utils import get_tqdm
@@ -11,9 +13,29 @@ from subplz.sub import (
 
 tqdm, trange = get_tqdm()
 
-# Define paths
 alass_dir = Path(__file__).parent
-alass_path = alass_dir / "alass-linux64"
+
+
+def _resolve_alass_path() -> Path:
+    """Locate the alass executable for the current platform.
+
+    The repo ships an x86_64 Linux ELF (`alass-linux64`). On macOS / other
+    platforms, fall back to `alass` or `alass-cli` on PATH if the user
+    installed one (e.g. `brew install alass`). Returns the path; callers
+    should check `.exists()` / `os.access(..., X_OK)` before use.
+    """
+    if platform.system() == "Linux":
+        return alass_dir / "alass-linux64"
+    for name in ("alass", "alass-cli"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    # Return a non-existent path so downstream raises a clear error rather than
+    # trying to exec a Linux binary on macOS.
+    return alass_dir / "alass-linux64"
+
+
+alass_path = _resolve_alass_path()
 
 
 # FIX 1: Add the custom exception class definition
@@ -63,6 +85,13 @@ def run_alass_alignment(
     print(
         f"🤝 Aligning {incorrect_subtitle_path.name} based on {og_subtitle_path.name}"
     )
+    if not alass_path.exists():
+        return False, (
+            f"❗ alass binary not available for {platform.system()} ({platform.machine()}). "
+            f"The repo only ships `alass-linux64`. On macOS, install one via Homebrew "
+            f"(`brew install alass`) and re-run. Alass is only needed for --alass; "
+            f"the epub→audiobook sync path does not use it."
+        )
     cmd = [
         str(alass_path),
         str(og_subtitle_path),

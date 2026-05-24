@@ -1,9 +1,23 @@
 import argparse
+import platform
 from types import SimpleNamespace
 from typing import List, Optional
 import multiprocessing
 import torch
 from dataclasses import dataclass, fields, field
+
+
+def _default_device() -> str:
+    """Pick a sensible default torch device for the current platform.
+
+    On Mac we use CPU: faster-whisper (CTranslate2) has no Metal backend, and
+    the stable-ts/torch path on MPS is not exercised by the default pipeline.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if platform.system() == "Darwin" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "cpu"
+    return "cpu"
 
 
 START_PUNC = """『「(（《｟[{"'“¿""" + """'“"¿([{-『「（〈《〔【｛［｟＜<‘“〝※"""
@@ -248,7 +262,7 @@ ARGUMENTS = {
     "device": {
         "flags": ["--device"],
         "kwargs": {
-            "default": "cuda" if torch.cuda.is_available() else "cpu",
+            "default": _default_device(),
             "help": "device to do inference on",
         },
     },

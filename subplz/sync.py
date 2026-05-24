@@ -11,7 +11,7 @@ from subplz.transcribe import transcribe
 from subplz.alass import sync_alass
 from subplz.files import get_sources, post_process
 from subplz.models import get_model, get_temperature, unload_model
-from subplz.align import nc_align, shift_align
+from subplz.align import greedy_align, nc_align, shift_align
 from subplz.files import sourceData
 from subplz.utils import get_tqdm, get_threads
 from .sub import write_subfail
@@ -170,10 +170,14 @@ def sync(source: sourceData, model, streams, be):
             shifted_segments = shift_align(segments)
             source.writer.write_sub(shifted_segments, source.output_full_paths[ai])
             if len(source.chapters) == 1 and be.respect_grouping:
-                new_segments = nc_align(
+                # greedy_align replaces nc_align: it walks the step-3 SRT in
+                # monotonic order and matches each script sentence to its
+                # best-fit sub by fuzzy ratio. Avoids the recursive matcher's
+                # collapse-in-dialog failure mode. nc_align is kept around for
+                # comparison but no longer the default.
+                new_segments = greedy_align(
                     chapters[0][0],
                     source.output_full_paths[ai],
-                    be.respect_grouping_count,
                 )
                 source.writer.write_sub(new_segments, source.output_full_paths[ai])
 

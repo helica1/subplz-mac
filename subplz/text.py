@@ -106,6 +106,116 @@ class EpubChapter:
         return r
 
 
+FRONT_MATTER_KEYWORDS = (
+    "目次",        # table of contents
+    "もくじ",       # table of contents (kana)
+    "Contents",
+    "Table of Contents",
+    "凡例",        # legend / explanatory notes
+    "奥付",        # colophon (back matter — also worth dropping)
+    "著作権",       # copyright
+    "Copyright",
+    "電子書籍",     # ebook disclaimer ("this e-book is laid out vertically...")
+    "サムネイル",   # thumbnail (ebook image disclaimer)
+    "再ダウンロード",  # re-download disclaimer
+    "リーディングシステム",  # reading-system disclaimer
+    "カバー",       # cover
+    "表紙",        # title page
+    "本書は",      # "this book is..." typical disclaimer prefix
+    "登録商標",     # registered trademarks
+)
+
+CHAPTER_START_MARKERS = (
+    "プロローグ",    # prologue
+    "Prologue",
+    "序章",        # introduction chapter
+    "序文",        # preface
+    "はじめに",     # foreword
+    "第一章",      # chapter 1
+    "第1章",
+    "Chapter 1",
+    "Chapter I",
+)
+
+
+def _chapter_text_for_filter(chapter) -> str:
+    """Return concatenated paragraph text of a chapter, for keyword scanning."""
+    try:
+        return "".join(p.text() for p in chapter.text())
+    except Exception:
+        return ""
+
+
+def _looks_like_front_matter(chapter) -> bool:
+    """Heuristic: small chapter dominated by ebook-meta keywords."""
+    title = (chapter.title or "").strip()
+    body = _chapter_text_for_filter(chapter)
+    body_len = len(body)
+
+    if any(k in title for k in FRONT_MATTER_KEYWORDS):
+        return True
+    if body_len < 600 and any(k in body for k in FRONT_MATTER_KEYWORDS):
+        return True
+    # Long disclaimer pages occasionally exceed 600 chars; require explicit keyword hit then.
+    if body_len < 1500 and sum(k in body for k in FRONT_MATTER_KEYWORDS) >= 2:
+        return True
+    return False
+
+
+def filter_front_matter(chapters: list) -> list:
+    """Drop epub spine items the audiobook narrator wouldn't read.
+
+    Strategy: walk from the start of the spine, skipping chapters that look
+    like front matter (title pages, copyright/legal disclaimers, TOC), until
+    we reach either an explicit chapter-start marker (`プロローグ`, `第一章`,
+    `Prologue`, ...) or a substantial prose paragraph (~>200 chars).
+
+    Falls back to the original list if it can't find a confident start — we'd
+    rather over-include than silently drop real prose.
+    """
+    if not chapters:
+        return chapters
+
+    start_idx = None
+    for i, chapter in enumerate(chapters):
+        title = (chapter.title or "").strip()
+        body = _chapter_text_for_filter(chapter)
+
+        # Front-matter detection FIRST. A TOC chapter literally lists chapter
+        # names like プロローグ / 第一章, so checking CHAPTER_START_MARKERS in
+        # its body would incorrectly accept it. The title-based front-matter
+        # check (e.g. title == "目次") catches that case.
+        if _looks_like_front_matter(chapter):
+            continue
+
+        if any(m in title for m in CHAPTER_START_MARKERS):
+            start_idx = i
+            break
+        if any(m in body[:200] for m in CHAPTER_START_MARKERS):
+            start_idx = i
+            break
+        # Substantial prose paragraph = likely the real story has started.
+        try:
+            paragraphs = chapter.text()
+        except Exception:
+            paragraphs = []
+        long_para = any(len(p.text()) > 200 for p in paragraphs)
+        if long_para:
+            start_idx = i
+            break
+
+    if start_idx is None or start_idx == 0:
+        return chapters
+
+    dropped = chapters[:start_idx]
+    print(
+        f"✂️  Dropped {len(dropped)} front-matter chapter(s) before "
+        f"'{(chapters[start_idx].title or '?').strip()[:40]}': "
+        f"{[(c.title or '?')[:30] for c in dropped]}"
+    )
+    return chapters[start_idx:]
+
+
 @dataclass(eq=True, frozen=True)
 class Epub:
     epub: epub.EpubBook
@@ -171,6 +281,7 @@ class Epub:
 
             chapter = EpubChapter(content=content, title=title, is_linear=v[1], idx=i)
             chapters.append(chapter)
+        chapters = filter_front_matter(chapters)
         return cls(
             epub=file,
             path=path,

@@ -330,6 +330,182 @@ def to_float(time_str):
     return total_seconds
 
 
+def greedy_align(split_script, subs_file, lookahead=30, min_score=45):
+    """Re-time script sentences against the step-3 (pre-grouping) SRT.
+
+    The previous implementation (nc_align) used recursive divide-and-conquer to
+    pick anchor points, which collapses badly in dialog-dense regions: a wrong
+    top-level anchor can poach sub cues that should belong to a deeper
+    recursion, leaving the deeper region with too few subs and forcing tens of
+    script sentences into one wall-of-text cue.
+
+    Greedy matching is the simpler, more robust alternative:
+      - For each script sentence (in order), scan a `lookahead`-sized window
+        of step-3 subs starting at the cursor.
+      - Try matching the sentence against 1, 2, or 3 consecutive subs
+        (Whisper sometimes splits a sentence across cues).
+      - Pick the highest-scoring match. If above `min_score`, emit a cue with
+        the matched sub(s)' timing and advance the cursor past them.
+      - If no match is good enough, interpolate timing just after the previous
+        cue (charge ~50 ms per char, min 1 s).
+
+    Monotonic order means we never re-use a sub, so two adjacent script
+    sentences can't both grab the same audio range. The window keeps us
+    resilient to occasional missed transcription chunks (we can skip ahead a
+    few subs to find a better anchor).
+    """
+    with open(split_script, encoding="utf-8") as s:
+        script = [line.rstrip("\n") for line in s if line.strip()]
+    with open(subs_file, encoding="utf-8") as srt:
+        subs = read_subtitles(srt)
+
+    if not subs or not script:
+        return []
+
+    new_subs = []
+    sub_cursor = 0
+    last_end = to_float(subs[0].start)
+    matched = 0
+    interpolated = 0
+
+    print(
+        f"🤝 Greedy alignment: {len(script)} script sentences against "
+        f"{len(subs)} sub cues (lookahead={lookahead}, min_score={min_score})"
+    )
+    for s_idx, script_text in enumerate(tqdm(script)):
+        window_end = min(len(subs), sub_cursor + lookahead)
+        best = (-1.0, -1, 1)  # (adjusted_score, sub_idx, n_consecutive)
+
+        if sub_cursor >= len(subs):
+            # No more audio. Interpolate the rest.
+            duration = max(len(script_text) * 0.05, 1.0)
+            new_subs.append(Segment(script_text, last_end, last_end + duration))
+            last_end += duration
+            interpolated += 1
+            continue
+
+        # Whisper happily splits a single long sentence into 10+ fragments at
+        # every comma. Fixed n=1..3 misses these. Instead, grow `combined`
+        # incrementally and keep extending until it's ~1.5x the script length;
+        # then stop (we've definitely overshot the sentence boundary).
+        script_len = max(len(script_text), 1)
+        for start_idx in range(sub_cursor, window_end):
+            combined = ""
+            for n in range(1, window_end - start_idx + 1):
+                combined += subs[start_idx + n - 1].text
+                if not combined:
+                    continue
+                raw_score = fuzz.ratio(script_text, combined)
+                # Penalize for skipping ahead — we'd rather take an in-order
+                # match than jump past many subs for a marginally better one.
+                # Penalty is small (0.5/sub) so it doesn't dominate when a
+                # later position genuinely matches much better.
+                position_penalty = (start_idx - sub_cursor) * 0.5
+                adjusted = raw_score - position_penalty
+                if adjusted > best[0]:
+                    best = (adjusted, start_idx, n)
+                # Once combined exceeds 1.5x script length, further extension
+                # can only make the match worse (extra non-matching chars).
+                if len(combined) >= script_len * 1.5:
+                    break
+
+        adjusted_score, best_idx, best_n = best
+        if best_idx >= 0 and adjusted_score >= min_score:
+            start_t = to_float(subs[best_idx].start)
+            end_t = to_float(subs[best_idx + best_n - 1].end)
+            # Guarantee non-decreasing timestamps even if Whisper produced
+            # tiny overlaps.
+            if start_t < last_end:
+                start_t = last_end
+            if end_t <= start_t:
+                end_t = start_t + max(len(script_text) * 0.05, 0.5)
+            new_subs.append(Segment(script_text, start_t, end_t))
+            sub_cursor = best_idx + best_n
+            last_end = end_t
+            matched += 1
+        else:
+            # No usable match in the window. Interpolate.
+            duration = max(len(script_text) * 0.05, 1.0)
+            new_subs.append(Segment(script_text, last_end, last_end + duration))
+            last_end += duration
+            interpolated += 1
+
+    print(
+        f"✅ Greedy alignment: matched {matched}/{len(script)} sentences "
+        f"({interpolated} interpolated, {len(subs) - sub_cursor} subs unused)"
+    )
+
+    # Post-process: smooth out runs of interpolated cues sandwiched between
+    # two matched anchors. Without this, an interpolated cue gets ~50ms/char
+    # of duration and is placed immediately after the previous one — so a 10s
+    # audio gap between two anchors can show all the in-between sentences in
+    # the first 2 seconds and leave 8 seconds of audio with no subtitle.
+    return _redistribute_interpolated_runs(new_subs, subs)
+
+
+def _redistribute_interpolated_runs(new_subs, original_subs):
+    """Smooth interpolated cue runs between matched anchors.
+
+    A cue is "matched" if its [start, end] lines up with one or more
+    contiguous original sub cues' timestamps. Anything else is interpolated.
+    For each run of interpolated cues between two matched anchors, redistribute
+    the run's timing to span the audio gap proportionally to character count.
+    """
+    # Build a set of (start, end) tuples that came from original subs for fast
+    # lookup. We allow approximate match within 50 ms to tolerate the small
+    # nudges greedy_align applies.
+    matched_starts = sorted(
+        set(round(to_float(s.start), 3) for s in original_subs)
+    )
+    matched_ends = sorted(
+        set(round(to_float(s.end), 3) for s in original_subs)
+    )
+
+    def _is_matched(cue):
+        return (
+            round(cue.start, 3) in matched_starts
+            or round(cue.end, 3) in matched_ends
+        )
+
+    i = 0
+    n = len(new_subs)
+    while i < n:
+        if _is_matched(new_subs[i]):
+            i += 1
+            continue
+        # Found start of an interpolated run.
+        run_start = i
+        while i < n and not _is_matched(new_subs[i]):
+            i += 1
+        run_end = i  # exclusive; new_subs[run_end] is the next anchor or off the end
+
+        if run_end >= n:
+            # Trailing interpolated run (audio ran out). Leave as-is — the
+            # heuristic timing is fine since there's no next anchor to span to.
+            break
+
+        # We have an interpolated run [run_start, run_end) bounded by:
+        #   - previous anchor: new_subs[run_start - 1].end (or 0 if at file start)
+        #   - next anchor: new_subs[run_end].start
+        gap_start = new_subs[run_start - 1].end if run_start > 0 else new_subs[run_start].start
+        gap_end = new_subs[run_end].start
+        gap = gap_end - gap_start
+        if gap <= 0.05:
+            continue  # No real audio gap; leave as-is.
+
+        run = new_subs[run_start:run_end]
+        weights = [max(len(c.text), 1) for c in run]
+        total_w = sum(weights)
+        cursor = gap_start
+        for c, w in zip(run, weights):
+            dur = gap * (w / total_w)
+            c.start = cursor
+            c.end = cursor + dur
+            cursor += dur
+
+    return new_subs
+
+
 def nc_align(split_script, subs_file, max_merge_count):
     with open(split_script, encoding="utf-8") as s:
         script = [ScriptLine(line) for line in read_script(s)]
@@ -345,19 +521,116 @@ def nc_align(split_script, subs_file, max_merge_count):
         script, subs, result, 0, len(script), 0, len(subs), max_merge_count, bar
     )
     bar.close()
+
+    # Precompute the median num_used_script across non-final entries so we can
+    # detect — and clamp — a runaway first/final cue. Without this guard the
+    # original code dumps ALL leading/trailing script into the bounding cues
+    # whenever alignment fails to cover one end (subplz/align.py historical bug).
+    if len(result) >= 2:
+        script_gaps = [result[j + 1][0] - result[j][0] for j in range(len(result) - 1)]
+        sub_gaps = [result[j + 1][2] - result[j][2] for j in range(len(result) - 1)]
+        script_gaps_sorted = sorted(script_gaps)
+        sub_gaps_sorted = sorted(sub_gaps)
+        median_script_per_cue = script_gaps_sorted[len(script_gaps_sorted) // 2]
+        median_sub_per_cue = sub_gaps_sorted[len(sub_gaps_sorted) // 2]
+    else:
+        median_script_per_cue = 1
+        median_sub_per_cue = 1
+    max_edge_script = max(median_script_per_cue * 5, 3)
+    # A "collapse" is a result-pair where the script gap is much bigger than
+    # the sub gap relative to typical cues — i.e., alignment failed to find
+    # anchors in that region and emitted one cue covering many script sentences
+    # against few sub entries. We expand collapses below using the available
+    # sub cues' own timestamps as boundaries.
+    collapse_script_threshold = max(median_script_per_cue * 4, 3)
+
+    def emit_split_collapse(script_pos, num_used_script, sub_pos, num_used_sub, out):
+        """Distribute many script sentences across the available sub cues.
+
+        Each output cue gets one script sentence (in order); its timing comes
+        from a proportional slice of the [sub_pos, sub_pos+num_used_sub] range.
+        Falls back to one big cue if the sub range is empty.
+        """
+        if num_used_sub <= 0 or num_used_script <= 0:
+            return False
+        # Collect the audio range from the available sub entries.
+        start_t = to_float(subs[sub_pos].start)
+        end_t = to_float(subs[sub_pos + num_used_sub - 1].end)
+        total_span = max(end_t - start_t, 0.001)
+        # Weight each script sentence by character count so long sentences
+        # get proportionally more display time.
+        sentences = [script[script_pos + k].text for k in range(num_used_script)]
+        weights = [max(len(s), 1) for s in sentences]
+        total_w = sum(weights)
+        cursor = start_t
+        for s, w in zip(sentences, weights):
+            dur = total_span * (w / total_w)
+            out.append(Segment(s, cursor, cursor + dur))
+            cursor += dur
+        return True
+
     for i, (script_pos, num_used_script, sub_pos, num_used_sub) in enumerate(
         tqdm(result)
     ):
         if i == 0:
-            script_pos = 0
-            sub_pos = 0
+            # Symmetric leading-edge guard. The original code forced
+            # script_pos=0 and sub_pos=0 here, which collapsed every unmatched
+            # leading script sentence (and audio chunk) into cue 1. If the
+            # audio doesn't start at the very beginning of the script (e.g.
+            # publisher intro, music bed, narrator's own preface), we now drop
+            # the unmatched lead-in instead of dumping it into one giant cue.
+            first_script_pos = result[0][0]
+            first_sub_pos = result[0][2]
+            if first_script_pos > max_edge_script:
+                print(
+                    f"⚠️  nc_align: alignment first matched at script sentence "
+                    f"{first_script_pos}/{len(script)}; dropping the unmatched lead-in "
+                    f"({first_script_pos - max_edge_script} sentence(s)) instead of "
+                    f"dumping them into one giant cue. This usually means the audio "
+                    f"starts later than the script, or the front matter wasn't fully "
+                    f"stripped."
+                )
+                script_pos = first_script_pos - max_edge_script
+            else:
+                script_pos = 0
+            sub_pos = max(0, first_sub_pos - max_edge_script)
 
         if i + 1 < len(result):
             num_used_script = result[i + 1][0] - script_pos
             num_used_sub = result[i + 1][2] - sub_pos
         else:
-            num_used_script = len(script) - script_pos
-            num_used_sub = len(subs) - sub_pos
+            remaining_script = len(script) - script_pos
+            remaining_sub = len(subs) - sub_pos
+            if remaining_script > max_edge_script:
+                print(
+                    f"⚠️  nc_align: alignment covered {script_pos}/{len(script)} script "
+                    f"sentences; dropping the unmatched tail ({remaining_script - max_edge_script} "
+                    f"sentence(s)) instead of dumping them into one giant cue. "
+                    f"This usually means the audio is shorter than the script, or "
+                    f"the back half didn't align cleanly."
+                )
+                num_used_script = max_edge_script
+            else:
+                num_used_script = remaining_script
+            num_used_sub = remaining_sub
+
+        # Mid-gap collapse mitigation: when alignment punted on this region
+        # (many script sentences mapped onto few sub cues), spread the script
+        # sentences across the sub range proportionally instead of dumping
+        # them all into a single multi-paragraph cue.
+        if (
+            num_used_script > collapse_script_threshold
+            and num_used_sub <= max(median_sub_per_cue * 2, 2)
+        ):
+            print(
+                f"⚠️  nc_align: collapse at script[{script_pos}:{script_pos + num_used_script}] "
+                f"({num_used_script} sentences) onto only {num_used_sub} sub cue(s); "
+                f"distributing across the audio range instead of one wall-of-text cue."
+            )
+            if emit_split_collapse(
+                script_pos, num_used_script, sub_pos, num_used_sub, new_subs
+            ):
+                continue
 
         scr_out = get_script(script, script_pos, num_used_script, "")
         scr = get_script(script, script_pos, num_used_script, " ‖ ")
