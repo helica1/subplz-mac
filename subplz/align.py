@@ -386,27 +386,43 @@ def greedy_align(split_script, subs_file, lookahead=30, min_score=45):
 
         # Whisper happily splits a single long sentence into 10+ fragments at
         # every comma. Fixed n=1..3 misses these. Instead, grow `combined`
-        # incrementally and keep extending until it's ~1.5x the script length;
-        # then stop (we've definitely overshot the sentence boundary).
+        # incrementally and keep extending until either the combined text
+        # exceeds ~1.5x the script length OR the combined audio duration
+        # exceeds what could plausibly narrate the script sentence (with a
+        # minimum so brief utterances next to silence still find a match).
         script_len = max(len(script_text), 1)
+        # JA narration ≈ 0.2 s/char in steady prose; allow up to 0.5 s/char as
+        # the ceiling, with a 15 s floor for short utterances. Cue-126 had a
+        # 30-char sentence spanning 87 s of audio — this cap would have
+        # rejected it.
+        max_audio_dur = max(15.0, script_len * 0.5)
         for start_idx in range(sub_cursor, window_end):
             combined = ""
+            start_t = to_float(subs[start_idx].start)
             for n in range(1, window_end - start_idx + 1):
                 combined += subs[start_idx + n - 1].text
                 if not combined:
                     continue
+                # Audio span of subs[start_idx : start_idx+n]
+                end_t = to_float(subs[start_idx + n - 1].end)
+                combined_dur = end_t - start_t
                 raw_score = fuzz.ratio(script_text, combined)
                 # Penalize for skipping ahead — we'd rather take an in-order
                 # match than jump past many subs for a marginally better one.
                 # Penalty is small (0.5/sub) so it doesn't dominate when a
                 # later position genuinely matches much better.
                 position_penalty = (start_idx - sub_cursor) * 0.5
+                # Penalize unreasonably long audio spans for short sentences;
+                # over the ceiling we discard the candidate entirely.
                 adjusted = raw_score - position_penalty
-                if adjusted > best[0]:
+                if combined_dur <= max_audio_dur and adjusted > best[0]:
                     best = (adjusted, start_idx, n)
-                # Once combined exceeds 1.5x script length, further extension
-                # can only make the match worse (extra non-matching chars).
-                if len(combined) >= script_len * 1.5:
+                # Stop extending n once either text length or audio duration
+                # has overshot — further extension only makes the match worse.
+                if (
+                    len(combined) >= script_len * 1.5
+                    or combined_dur >= max_audio_dur
+                ):
                     break
 
         adjusted_score, best_idx, best_n = best
@@ -496,12 +512,25 @@ def _redistribute_interpolated_runs(new_subs, original_subs):
         run = new_subs[run_start:run_end]
         weights = [max(len(c.text), 1) for c in run]
         total_w = sum(weights)
+        # Cap each interpolated cue at a sensible display duration. If the
+        # proportional share exceeds this, the excess becomes a silent gap
+        # (better UX than showing a 4-char utterance for 87 seconds — that
+        # bug used to show up in the full audiobook output as e.g. cue 126).
+        # JA narration: ~0.2 s/char. Allow up to 0.5 s/char as ceiling, with
+        # a 6 s floor so short sentences still get readable display time.
+        def _cue_cap(text):
+            return max(6.0, len(text) * 0.5)
+
         cursor = gap_start
         for c, w in zip(run, weights):
-            dur = gap * (w / total_w)
+            proportional = gap * (w / total_w)
+            dur = min(proportional, _cue_cap(c.text))
             c.start = cursor
             c.end = cursor + dur
             cursor += dur
+        # Any leftover time at the end of the run becomes a silent gap before
+        # the next matched anchor. That's fine — the audio there likely
+        # contains music, silence, or content Whisper couldn't transcribe.
 
     return new_subs
 

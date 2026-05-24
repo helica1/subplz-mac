@@ -162,6 +162,93 @@ def _looks_like_front_matter(chapter) -> bool:
     return False
 
 
+BACK_MATTER_KEYWORDS = (
+    "奥付",        # colophon
+    "装幀",        # book design credit
+    "装丁",        # book design credit (alt kanji)
+    "本電子書籍",   # ebook usage disclaimers
+    "無断で複製",   # "no unauthorized reproduction"
+    "無断複製",
+    "転載を禁",
+    "改変、改ざん",
+    "サポート",     # "support"
+    "問い合わせ",   # "inquiries"
+    "Japanese text only",
+    "発行所",      # publisher
+    "発行者",      # publisher contact
+    "印刷",        # printing info
+    "ISBN",
+    "著作権",      # copyright
+    "Copyright",
+    "©",
+    "(c)",
+)
+
+
+def filter_back_matter(chapters: list) -> list:
+    """Symmetric to filter_front_matter, but walks from the END.
+
+    Audiobook narrators usually don't read the colophon, copyright disclaimer,
+    or "no unauthorized redistribution" boilerplate at the back of an epub.
+    Walk backward from the last chapter, dropping ones dominated by
+    BACK_MATTER_KEYWORDS, until we hit a chapter with substantial prose (or
+    a likely afterword/epilogue — those *are* often narrated).
+
+    Stops dropping at:
+      - A chapter with a long prose paragraph (>200 chars) that isn't
+        keyword-dominated.
+      - A chapter whose title contains エピローグ / Epilogue / あとがき /
+        Afterword — those are usually narrated.
+    """
+    if not chapters:
+        return chapters
+
+    NARRATED_TAIL_MARKERS = (
+        "エピローグ",     # epilogue
+        "Epilogue",
+        "あとがき",       # afterword
+        "Afterword",
+        "解説",          # commentary/critical essay (sometimes narrated)
+    )
+
+    end_idx = len(chapters)
+    for i in range(len(chapters) - 1, -1, -1):
+        chapter = chapters[i]
+        title = (chapter.title or "").strip()
+        body = _chapter_text_for_filter(chapter)
+
+        # Stop dropping at narrated-tail markers — these are story content.
+        if any(m in title for m in NARRATED_TAIL_MARKERS):
+            break
+        if any(m in body[:200] for m in NARRATED_TAIL_MARKERS):
+            break
+
+        # Heuristic: dominated by back-matter keywords?
+        keyword_hits = sum(k in body for k in BACK_MATTER_KEYWORDS)
+        title_hit = any(k in title for k in BACK_MATTER_KEYWORDS)
+        body_len = len(body)
+
+        if title_hit or keyword_hits >= 2:
+            end_idx = i
+            continue
+        if body_len < 600 and keyword_hits >= 1:
+            end_idx = i
+            continue
+        # Otherwise this is real prose — stop here.
+        break
+
+    if end_idx == len(chapters):
+        return chapters
+
+    dropped = chapters[end_idx:]
+    print(
+        f"✂️  Dropped {len(dropped)} back-matter chapter(s) after "
+        f"'{(chapters[end_idx - 1].title or '?').strip()[:40]}': "
+        f"{[(c.title or '?')[:30] for c in dropped]}"
+    )
+    return chapters[:end_idx]
+
+
 def filter_front_matter(chapters: list) -> list:
     """Drop epub spine items the audiobook narrator wouldn't read.
 
@@ -282,6 +369,7 @@ class Epub:
             chapter = EpubChapter(content=content, title=title, is_linear=v[1], idx=i)
             chapters.append(chapter)
         chapters = filter_front_matter(chapters)
+        chapters = filter_back_matter(chapters)
         return cls(
             epub=file,
             path=path,
