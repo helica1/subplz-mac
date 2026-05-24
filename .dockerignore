@@ -1,0 +1,29 @@
+.env
+__pycache__/
+.ruff_cache/
+.vscode/
+build/
+sub_config/
+.pytest_cache/
+.docker/
+build/
+
+*.egg-info
+
+# Editor & Local Config
+.vscode/
+.env
+.docker/
+pylintrc
+
+# Docker Compose file
+compose.yml
+
+# Runtime Data, Cache, and Logs
+config/
+SyncCache/
+logs/
+
+# Any other runtime files
+mapping.json
+sub.json

@@ -1,0 +1,15 @@
+.env
+__pycache__/
+.ruff_cache/
+.vscode/
+build/
+config/
+.pytest_cache/
+.docker/
+*.egg-info
+
+SyncCache/
+logs/
+
+mapping.json
+sub.json
