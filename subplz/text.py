@@ -182,6 +182,14 @@ BACK_MATTER_KEYWORDS = (
     "Copyright",
     "©",
     "(c)",
+    # Author-bio markers — typical structure is "{name}（ふりがな）{year}年
+    # {city}生まれ、{university}{department}卒業。{year}年『{title}』で{prize}を受賞..."
+    # Multiple of these in one chapter is a strong bio signal.
+    "受賞",        # "received award"
+    "文学賞",      # "literary prize"
+    "文学部",      # "department of literature"
+    "著者紹介",    # "author introduction"
+    "略歴",        # "brief biography"
 )
 
 

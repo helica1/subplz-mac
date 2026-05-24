@@ -406,16 +406,42 @@ def greedy_align(split_script, subs_file, lookahead=30, min_score=45):
                 # Audio span of subs[start_idx : start_idx+n]
                 end_t = to_float(subs[start_idx + n - 1].end)
                 combined_dur = end_t - start_t
-                raw_score = fuzz.ratio(script_text, combined)
+                # Tolerant scoring: low-quality models (e.g. `tiny` on JA)
+                # mistranscribe characters, dropping fuzz.ratio below the
+                # acceptance threshold even when the boundary is correct.
+                # partial_ratio finds the best substring of combined that
+                # matches script_text — more forgiving of noise — but we
+                # only use it when the lengths are comparable. Otherwise a
+                # short script can spuriously match any long combined that
+                # happens to contain a similar substring, causing the cursor
+                # to advance past audio that belonged to subsequent script
+                # sentences (we saw 130-cue interpolation cascades from this).
+                score_ratio = fuzz.ratio(script_text, combined)
+                len_ratio = len(combined) / max(script_len, 1)
+                if script_len >= 12 and 0.6 <= len_ratio <= 1.4:
+                    score_partial = fuzz.partial_ratio(script_text, combined) * 0.75
+                    raw_score = max(score_ratio, score_partial)
+                else:
+                    raw_score = score_ratio
                 # Penalize for skipping ahead — we'd rather take an in-order
                 # match than jump past many subs for a marginally better one.
                 # Penalty is small (0.5/sub) so it doesn't dominate when a
                 # later position genuinely matches much better.
                 position_penalty = (start_idx - sub_cursor) * 0.5
-                # Penalize unreasonably long audio spans for short sentences;
-                # over the ceiling we discard the candidate entirely.
                 adjusted = raw_score - position_penalty
-                if combined_dur <= max_audio_dur and adjusted > best[0]:
+                # Tie-break preference for smaller n: when two candidates
+                # both pass min_score and are nearly equal, prefer the one
+                # that consumes fewer subs (less likely to swallow audio
+                # that belongs to subsequent script sentences). Critically,
+                # the new candidate must itself clear min_score — otherwise
+                # we'd downgrade a passing match into a failing one.
+                tie_break = (
+                    adjusted >= min_score
+                    and best[0] >= min_score
+                    and (best[0] - adjusted) < 1.0
+                    and n < best[2]
+                )
+                if combined_dur <= max_audio_dur and (adjusted > best[0] or tie_break):
                     best = (adjusted, start_idx, n)
                 # Stop extending n once either text length or audio duration
                 # has overshot — further extension only makes the match worse.

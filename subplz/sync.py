@@ -175,9 +175,19 @@ def sync(source: sourceData, model, streams, be):
                 # best-fit sub by fuzzy ratio. Avoids the recursive matcher's
                 # collapse-in-dialog failure mode. nc_align is kept around for
                 # comparison but no longer the default.
+                #
+                # Lower the match threshold for noisy models. With `tiny` on
+                # Japanese, real matches often score 30-50 because Whisper
+                # mistranscribes kana — the default 45 rejects most of them,
+                # producing huge interpolation chains. For accurate models
+                # like turbo, keep the higher threshold so weak/spurious
+                # matches don't poison the cursor and orphan real ones.
+                noisy_models = {"tiny", "tiny.en", "base", "base.en", "small", "small.en"}
+                min_score = 35 if be.model_name in noisy_models else 45
                 new_segments = greedy_align(
                     chapters[0][0],
                     source.output_full_paths[ai],
+                    min_score=min_score,
                 )
                 source.writer.write_sub(new_segments, source.output_full_paths[ai])
 
