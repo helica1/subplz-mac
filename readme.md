@@ -37,7 +37,7 @@ https://user-images.githubusercontent.com/32607317/219973521-5a5c2bf2-4df1-422b-
 brew install python@3.11 ffmpeg
 
 # 3. Clone and set up a venv
-git clone https://github.com/YOUR_USERNAME/subplz-mac.git
+git clone https://github.com/helica1/subplz-mac.git
 cd subplz-mac
 /opt/homebrew/bin/python3.11 -m venv .venv
 

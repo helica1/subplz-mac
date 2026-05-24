@@ -21,7 +21,7 @@ So I forked it and rewrote the parts that didn't fit Mac:
 
 Validated end-to-end on two Japanese audiobooks (one Kadokawa thriller, one Murakami short story collection). The output is per-sentence cues with sub-second timing — what you'd use with [ttu-reader](https://github.com/Renji-XD/ttu-whispersync) for full immersion-reading, or in a player with subtitles overlaid.
 
-Repo: [link]
+Repo: https://github.com/helica1/subplz-mac
 
 Known limitations: tiny model on Japanese still has interpolation chains in continuous-monologue regions (turbo is genuinely better there); long quoted dialog blocks are kept as single cues (the script splits don't reach inside Japanese「」quotes); SRT cues placed past the end of audio when narrator skips epub content.
 
@@ -43,19 +43,19 @@ Final layer is silero-vad-based boundary refinement: snap to actual speech onset
 
 Tested end-to-end on Japanese audiobooks. Per-sentence cues, sub-second timing, 88.9% sentences directly matched to audio on the larger turbo model.
 
-Code, README, and benchmarks: [link]
+Code, README, and benchmarks: https://github.com/helica1/subplz-mac
 
 ---
 
 ## Draft C — Short Twitter/Mastodon/Bluesky
 
-I forked SubPlz to run on Apple Silicon Macs. M-series Max generates per-sentence subtitles for a 9-hour Japanese audiobook in ~7 minutes via MLX (Metal + Neural Engine). For reference, RTX 3090 takes ~30 min for the same job. Repo: [link]
+I forked SubPlz to run on Apple Silicon Macs. M-series Max generates per-sentence subtitles for a 9-hour Japanese audiobook in ~7 minutes via MLX (Metal + Neural Engine). For reference, RTX 3090 takes ~30 min for the same job. Repo: https://github.com/helica1/subplz-mac
 
 ---
 
 ## Posting checklist
 
-Before posting any of the above, replace `[link]` with the actual repo URL.
+Before posting, double-check the repo URL (`https://github.com/helica1/subplz-mac`) actually exists publicly.
 
 Consider adding:
 - A screenshot of the GUI with a real book loaded

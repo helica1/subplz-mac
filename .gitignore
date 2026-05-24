@@ -20,3 +20,5 @@ smoketest/
 smoketest_matched/
 smoketest_15min/
 epub-audiobook/
+.DS_Store
+.claude/
