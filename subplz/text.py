@@ -190,7 +190,51 @@ BACK_MATTER_KEYWORDS = (
     "文学部",      # "department of literature"
     "著者紹介",    # "author introduction"
     "略歴",        # "brief biography"
+    # References / bibliography sections — never narrated in audiobooks.
+    "参考文献",    # "references"
+    "引用文献",    # "cited works"
+    "Bibliography",
+    "References",
 )
+
+
+NEVER_NARRATED_TITLE_KEYWORDS = (
+    # Reference/bibliography sections — never narrated regardless of where
+    # they appear in the spine. Some epubs put them BETWEEN content chapters
+    # (weird publisher ordering), so the walk-backward back-matter filter
+    # can't catch them. This filter drops them by title alone, anywhere.
+    "参考文献",    # references
+    "引用文献",    # cited works
+    "［参考文献",   # bracketed variant
+    "Bibliography",
+    "References",
+    "著者略歴",    # author bio
+    "【著者略歴】",
+    "略歴",
+)
+
+
+def filter_never_narrated_chapters(chapters: list) -> list:
+    """Drop chapters whose title indicates non-narrated content, anywhere
+    in the spine. Complements filter_back_matter for epubs that interleave
+    references/bios between narrative chapters in spine order.
+    """
+    if not chapters:
+        return chapters
+    kept = []
+    dropped = []
+    for c in chapters:
+        title = (c.title or "").strip()
+        if any(k in title for k in NEVER_NARRATED_TITLE_KEYWORDS):
+            dropped.append(c)
+        else:
+            kept.append(c)
+    if dropped:
+        print(
+            f"✂️  Dropped {len(dropped)} never-narrated chapter(s) by title: "
+            f"{[(c.title or '?')[:30] for c in dropped]}"
+        )
+    return kept
 
 
 def filter_back_matter(chapters: list) -> list:
@@ -217,6 +261,12 @@ def filter_back_matter(chapters: list) -> list:
         "あとがき",       # afterword
         "Afterword",
         "解説",          # commentary/critical essay (sometimes narrated)
+        "終章",          # "final chapter" — definitely narrated content
+        "終わりに",       # "in closing" / wrap-up — narrated
+        "おわりに",       # "in closing" (kana) — narrated
+        "結論",          # "conclusion" — narrated
+        "むすび",         # "conclusion" / closing remarks — narrated
+        "結語",          # "concluding remarks" — narrated
     )
 
     end_idx = len(chapters)
@@ -378,6 +428,7 @@ class Epub:
             chapters.append(chapter)
         chapters = filter_front_matter(chapters)
         chapters = filter_back_matter(chapters)
+        chapters = filter_never_narrated_chapters(chapters)
         return cls(
             epub=file,
             path=path,
