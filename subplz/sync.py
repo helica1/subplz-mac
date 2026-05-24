@@ -12,6 +12,7 @@ from subplz.alass import sync_alass
 from subplz.files import get_sources, post_process
 from subplz.models import get_model, get_temperature, unload_model
 from subplz.align import greedy_align, nc_align, shift_align
+from subplz.vad_snap import rebalance_skewed_neighbors, vad_snap_cues
 from subplz.files import sourceData
 from subplz.utils import get_tqdm, get_threads
 from .sub import write_subfail
@@ -189,6 +190,24 @@ def sync(source: sourceData, model, streams, be):
                     source.output_full_paths[ai],
                     min_score=min_score,
                 )
+                # VAD-based boundary snap. Whisper's word-attention endings
+                # are systematically truncated by ~100-300 ms and starts can
+                # include leading silence. Silero VAD detects actual speech
+                # onsets/offsets; we snap each cue's boundary to the nearest
+                # one within ±300 ms — fixes pause-bounded sentences; leaves
+                # continuous-narration cues alone.
+                # Rebalance adjacent cues with skewed char-rate first. This
+                # catches Whisper-segmentation artifacts where one sub's
+                # [start, end] is way wider than its text — the next sub
+                # gets squeezed. We redistribute audio between them by
+                # char-count, BEFORE VAD snaps to actual speech transitions.
+                rebalanced = rebalance_skewed_neighbors(new_segments)
+                if rebalanced:
+                    print(f"⚖️  Rebalanced {rebalanced} adjacent-cue boundaries (char-rate skew)")
+                if getattr(be, "vad_snap", True):
+                    audio_path = streams[ai][2][0].path
+                    snapped = vad_snap_cues(new_segments, audio_path)
+                    print(f"🎯 VAD snap: refined {snapped} cue boundaries")
                 source.writer.write_sub(new_segments, source.output_full_paths[ai])
 
 

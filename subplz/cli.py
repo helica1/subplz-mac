@@ -290,6 +290,14 @@ ARGUMENTS = {
             "action": "store_true",
         },
     },
+    "vad_snap": {
+        "flags": ["--vad-snap"],
+        "kwargs": {
+            "default": True,
+            "help": "Snap cue boundaries to silero-vad-detected speech onsets/offsets. Fixes Whisper's ~200ms timestamp truncation in pause-bounded sentences. Use --no-vad-snap to disable.",
+            "action": argparse.BooleanOptionalAction,
+        },
+    },
     "local_only": {
         "flags": ["--local-only"],
         "kwargs": {
@@ -544,6 +552,7 @@ class SyncParams:
     # Faster Whisper
     faster_whisper: bool = field(metadata={"category": "optional"})
     mlx: bool = field(metadata={"category": "optional"})
+    vad_snap: bool = field(metadata={"category": "optional"})
     local_only: bool = field(metadata={"category": "optional"})
     # stable-ts
     stable_ts: bool = field(metadata={"category": "optional"})
@@ -635,6 +644,7 @@ class GenParams:
     # Faster Whisper
     faster_whisper: bool = field(metadata={"category": "optional"})
     mlx: bool = field(metadata={"category": "optional"})
+    vad_snap: bool = field(metadata={"category": "optional"})
     local_only: bool = field(metadata={"category": "optional"})
     # stable-ts
     stable_ts: bool = field(metadata={"category": "optional"})
