@@ -63,6 +63,28 @@ anki = [
   "requests==2.26.0",
   "subs2cia@git+https://github.com/kanjieater/subs2cia#egg=de536d1c983641cd590180aa93c080010b1c5665"
 ]
+# MLX backend: Apple Silicon Metal + Neural Engine transcription (much
+# faster than faster-whisper-on-CPU on Mac). Enable with `--mlx`.
+mlx = [
+  "mlx-whisper>=0.4.3",
+]
+# VAD-based cue boundary refinement via silero-vad. torchcodec is required
+# for silero's audio I/O when torchaudio >= 2.9.
+vad = [
+  "silero-vad>=6.0.0",
+  "torchcodec>=0.10",
+]
+# Drag-and-drop PySide6 GUI: subplz_gui.py
+gui = [
+  "PySide6>=6.10",
+]
+# Convenience: everything Mac users typically want.
+mac = [
+  "mlx-whisper>=0.4.3",
+  "silero-vad>=6.0.0",
+  "torchcodec>=0.10",
+  "PySide6>=6.10",
+]
 
 [project.scripts]
 subplz = "subplz.__main__:main"

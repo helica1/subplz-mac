@@ -4,6 +4,75 @@ https://user-images.githubusercontent.com/32607317/219973521-5a5c2bf2-4df1-422b-
 
 🫴 Generate, sync, and manage subtitle files for any media; Generate your own audiobook subs similar to Kindle's Immersion Reading 📖🎧
 
+> **🍎 This is a macOS Apple Silicon fork** of the original [SubPlz by kanjieater](https://github.com/kanjieater/SubPlz). It adds an MLX-Whisper backend (Metal GPU + Neural Engine), an improved alignment algorithm, VAD-based timing refinement, and a drag-and-drop GUI. See [What's new in this fork](#-whats-new-in-this-fork) below.
+
+---
+
+## ✨ What's new in this fork
+
+| Feature | Original SubPlz | This fork |
+|---|---|---|
+| **Apple Silicon support** | CPU-only via faster-whisper | Native MLX (Metal + Neural Engine) backend, **~76× realtime** on M-series Max |
+| **Alignment algorithm** | `nc_align` (recursive); collapses in dialog-dense regions | `greedy_align` (monotonic + adaptive-n + partial-ratio fallback); 1 sentence per cue, no collapses |
+| **Timing precision** | Word-level from Whisper | VAD-snapped + char-rate-rebalanced; cues bracket actual speech, leading/trailing silence trimmed |
+| **Front/back matter** | Included in cues | Filtered out (title pages, copyright, TOC, author bios) |
+| **GUI** | CLI only | Drag-and-drop PySide6 app with batch mode, progress bars, "Open output folder" |
+| **Tested on Japanese audiobooks** | Yes | Yes — full 9 h book → SRT in **~7 minutes wall clock** on M-series Max, 88.9% sentence-level match rate |
+
+### Benchmark (Japanese 9 h 9 min audiobook, `turbo` model)
+
+| Backend | Transcription time | Realtime ratio | Wall clock |
+|---|---|---|---|
+| Reference: RTX 3090 + CUDA + faster-whisper | ~30 min | ~18× | ~30 min |
+| This fork: M-series Max CPU + faster-whisper | 98 min | 5.6× | ~1.6 h |
+| **This fork: M-series Max + MLX (Metal + ANE)** | **6.7 min** | **82×** | **~7 min** |
+
+---
+
+## 🍎 Quick start (macOS Apple Silicon)
+
+```bash
+# 1. Install Homebrew if you don't have it: https://brew.sh
+# 2. Install Python 3.11 and ffmpeg
+brew install python@3.11 ffmpeg
+
+# 3. Clone and set up a venv
+git clone https://github.com/YOUR_USERNAME/subplz-mac.git
+cd subplz-mac
+/opt/homebrew/bin/python3.11 -m venv .venv
+
+# 4. Install with MLX + VAD + GUI extras
+.venv/bin/pip install -e ".[mlx,vad,gui]"
+```
+
+**Sync an audiobook (CLI):**
+```bash
+.venv/bin/subplz sync \
+  --audio "/path/to/book.mp3" \
+  --text  "/path/to/book.epub" \
+  --output-dir "/path/to/output" \
+  --lang ja --model turbo --mlx --respect-grouping
+```
+
+**Or use the GUI:**
+```bash
+.venv/bin/python subplz_gui.py
+```
+
+The GUI supports drag-and-drop of audio files, epub/text files, or whole folders for batch processing.
+
+---
+
+## 🎛️ New flags in this fork
+
+- `--mlx` — use MLX-Whisper backend (Apple Silicon only; vastly faster than CPU)
+- `--vad-snap` / `--no-vad-snap` — snap cue boundaries to silero-vad-detected speech (default on)
+- `--respect-grouping` — re-time each script sentence as one cue via `greedy_align` (existing flag; now uses the new algorithm)
+
+---
+
+
+
 ## Table of Contents
 
 - [SubPlz🫴: Get Incredibly Accurate Subs for Anything](#subplz-get-incredibly-accurate-subs-for-anything)
@@ -792,3 +861,20 @@ The GOAT delivers again; The best Japanese reading experience ttu-reader paired 
 A cool tool to turn these audiobook subs into Visual Novels
 
 - https://github.com/asayake-b5/audiobooksync2renpy
+
+---
+
+# Credits & License
+
+This is a community fork of [SubPlz by kanjieater](https://github.com/kanjieater/SubPlz). All credit for the original project, the alignment pipeline foundation, the chapter-fuzzy-matching, the Anki integration approach, and the broader project vision belongs to the upstream author.
+
+**Changes in this fork** (beyond upstream v4.0.0):
+
+- macOS Apple Silicon support: native MLX-Whisper backend (Metal + Neural Engine), platform-aware device defaults, guarded Linux-only `alass` binary.
+- New `greedy_align` algorithm replacing `nc_align`: monotonic left-to-right matching with adaptive sub-grouping, partial-ratio fallback for noisy transcription, model-dependent score threshold.
+- VAD-based timing refinement via silero-vad: trim leading/trailing silence within cues, snap boundaries to actual speech transitions within tolerance.
+- Char-rate rebalance: redistributes audio between adjacent cues when Whisper's segmentation gives one sub way more audio than its text justifies.
+- Epub front/back matter filters: drops title pages, copyright disclaimers, table-of-contents, colophon, author bios.
+- PySide6 drag-and-drop GUI with batch mode, progress bars, and an "Open output folder" reveal-in-Finder action.
+
+Licensed under MIT, matching the upstream project.
