@@ -53,6 +53,8 @@ SUBPLZ_BIN = PROJECT_ROOT / ".venv" / "bin" / "subplz"
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".mp4", ".aac", ".flac", ".ogg", ".wav", ".opus", ".mkv", ".webm"}
 TEXT_EXTS = {".epub", ".txt", ".srt", ".vtt", ".ass"}
+# SRS mode is audio+SRT only — epub doesn't have timestamps to slice on.
+SRS_TEXT_EXTS = {".srt", ".vtt", ".ass"}
 
 # Realtime ratios measured on this user's M-series Max with turbo + JA.
 # Used to estimate per-book progress when we have no granular signal.
@@ -62,10 +64,14 @@ REALTIME_RATIO_CPU = 5.6
 
 @dataclass
 class Job:
-    """One audiobook to sync.
+    """One audiobook to process.
 
-    Either `workdir` is set (subdir mode — subplz uses -d) or `audio`/`text`
-    are explicit (flat-folder mode — subplz uses --audio/--text/--output-dir).
+    For sync: either `workdir` is set (subdir mode — subplz uses -d) or
+    `audio`/`text` are explicit (flat-folder mode — subplz uses
+    --audio/--text/--output-dir).
+
+    For srs: only `audio` + `text` are used (-d isn't a thing for srs);
+    workdir is ignored.
     """
 
     label: str
@@ -79,9 +85,9 @@ def find_one_audio(folder: Path) -> Optional[Path]:
     return files[0] if files else None
 
 
-def find_one_text(folder: Path) -> Optional[Path]:
-    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in TEXT_EXTS]
-    # Prefer epub > txt > others
+def find_one_text(folder: Path, exts: set[str] = TEXT_EXTS) -> Optional[Path]:
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    # Prefer epub > txt > others (irrelevant for srs which only accepts srt/vtt/ass)
     files.sort(key=lambda p: (
         0 if p.suffix.lower() == ".epub" else 1 if p.suffix.lower() == ".txt" else 2,
         p.name,
@@ -89,8 +95,12 @@ def find_one_text(folder: Path) -> Optional[Path]:
     return files[0] if files else None
 
 
-def detect_pairs(folder: Path) -> list[Job]:
-    """Subdirs-first auto-detection, falling back to flat-stem pairing."""
+def detect_pairs(folder: Path, text_exts: set[str] = TEXT_EXTS) -> list[Job]:
+    """Subdirs-first auto-detection, falling back to flat-stem pairing.
+
+    `text_exts` controls which sidecar files count as the "text" half.
+    Defaults to TEXT_EXTS (sync mode); pass SRS_TEXT_EXTS for srs mode.
+    """
     pairs: list[Job] = []
 
     # Strategy 1: each subdir has one audio + one text
@@ -98,7 +108,7 @@ def detect_pairs(folder: Path) -> list[Job]:
         if not sub.is_dir() or sub.name.startswith("."):
             continue
         a = find_one_audio(sub)
-        t = find_one_text(sub)
+        t = find_one_text(sub, text_exts)
         if a and t:
             pairs.append(Job(label=sub.name, audio=a, text=t, workdir=sub))
 
@@ -107,7 +117,7 @@ def detect_pairs(folder: Path) -> list[Job]:
 
     # Strategy 2: flat folder, pair by stem
     audios = {p.stem: p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS}
-    texts = {p.stem: p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in TEXT_EXTS}
+    texts = {p.stem: p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in text_exts}
     common = sorted(set(audios) & set(texts))
     for stem in common:
         pairs.append(Job(label=stem, audio=audios[stem], text=texts[stem]))
@@ -170,6 +180,8 @@ class SyncWorker(QObject):
                 pass
 
     def _build_cmd(self, job: Job) -> list[str]:
+        if self.opts.get("action") == "srs":
+            return self._build_srs_cmd(job)
         cmd = [
             str(SUBPLZ_BIN),
             "sync",
@@ -196,6 +208,38 @@ class SyncWorker(QObject):
             ]
         return cmd
 
+    def _build_srs_cmd(self, job: Job) -> list[str]:
+        out_dir = self.opts.get("srs_output_dir") or str(job.audio.parent)
+        cmd = [
+            str(SUBPLZ_BIN),
+            "srs",
+            "--audio",
+            str(job.audio),
+            "--text",
+            str(job.text),
+            "--output-dir",
+            out_dir,
+            "--pad-ms",
+            str(self.opts.get("srs_pad_ms", 200)),
+            "--fade-ms",
+            str(self.opts.get("srs_fade_ms", 10)),
+        ]
+        if not self.opts.get("srs_vad_check", True):
+            cmd.append("--no-vad-check")
+        if not self.opts.get("srs_cover", True):
+            cmd.append("--no-cover")
+        # "auto" is the CLI default; only emit when the user changed it, to
+        # keep the command line readable in the log.
+        br = self.opts.get("srs_bitrate", "auto")
+        if br and br != "auto":
+            cmd += ["--bitrate", br]
+        ch = self.opts.get("srs_channels", "auto")
+        if ch and ch != "auto":
+            cmd += ["--channels", ch]
+        # Per-job deck name; falls back to the audio stem inside the CLI.
+        cmd += ["--deck-name", job.label]
+        return cmd
+
     def run(self):
         total = len(self.jobs)
         if total == 0:
@@ -219,7 +263,7 @@ class SyncWorker(QObject):
         self.all_done.emit()
 
     def _run_one(self, job: Job):
-        # Estimate transcription duration based on backend.
+        # Estimate transcription duration based on backend (sync mode only).
         audio_dur = get_audio_duration(job.audio)
         ratio = REALTIME_RATIO_MLX if self.opts.get("mlx") else REALTIME_RATIO_CPU
         expected_transcribe = max(audio_dur / ratio, 5.0) if audio_dur > 0 else 60.0
@@ -237,8 +281,11 @@ class SyncWorker(QObject):
             env=env,
         )
 
+        is_srs = self.opts.get("action") == "srs"
         transcribe_start: Optional[float] = None
         phase = "starting"
+        # tqdm "cutting: 12%|...| 503/4177" — pulls current/total
+        srs_progress_re = re.compile(r"(cutting|vad-check):\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)")
 
         # select-based read so we can emit periodic time-based progress even
         # when subprocess is silent during long MLX transcription.
@@ -261,22 +308,47 @@ class SyncWorker(QObject):
                 line_clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
                 self.log.emit(line_clean)
 
-                # Phase detection from known log markers
-                if "MLX-Whisper backend" in line_clean or "Transcribing with" in line_clean or "Attempting transcription" in line_clean:
-                    if transcribe_start is None:
-                        transcribe_start = time.time()
-                        phase = "transcribing"
-                        self.status.emit(f"📚 {job.label}: transcribing audio…")
-                elif "Transcribing took:" in line_clean:
-                    phase = "aligning"
-                    self.book_progress.emit(92)
-                    self.status.emit(f"📚 {job.label}: aligning text to audio…")
-                elif "Greedy alignment:" in line_clean and "matched" not in line_clean:
-                    self.book_progress.emit(95)
-                elif "Successfully wrote" in line_clean:
-                    self.book_progress.emit(100)
-                    self.status.emit(f"📚 {job.label}: done.")
-            elif phase == "transcribing" and transcribe_start is not None:
+                if is_srs:
+                    # srs phases: parse cues → cut clips → vad-check → write apkg
+                    if "Parsed" in line_clean and "cues from" in line_clean:
+                        self.status.emit(f"📚 {job.label}: parsed cues")
+                    elif "Slicing" in line_clean and "clips" in line_clean:
+                        phase = "cutting"
+                        self.status.emit(f"📚 {job.label}: cutting audio clips…")
+                    elif "VAD edge check" in line_clean:
+                        phase = "vad"
+                        self.status.emit(f"📚 {job.label}: checking clip boundaries…")
+                    elif "Wrote " in line_clean and ".apkg" in line_clean:
+                        self.book_progress.emit(100)
+                        self.status.emit(f"📚 {job.label}: deck written.")
+                    else:
+                        m = srs_progress_re.search(line_clean)
+                        if m:
+                            kind, cur, total = m.group(1), int(m.group(2)), int(m.group(3))
+                            if total > 0:
+                                frac = cur / total
+                                # Cutting takes the first 45%, vad-check the next 50%, pkg the last 5%
+                                if kind == "cutting":
+                                    self.book_progress.emit(int(frac * 45))
+                                else:
+                                    self.book_progress.emit(45 + int(frac * 50))
+                else:
+                    # sync phases (unchanged)
+                    if "MLX-Whisper backend" in line_clean or "Transcribing with" in line_clean or "Attempting transcription" in line_clean:
+                        if transcribe_start is None:
+                            transcribe_start = time.time()
+                            phase = "transcribing"
+                            self.status.emit(f"📚 {job.label}: transcribing audio…")
+                    elif "Transcribing took:" in line_clean:
+                        phase = "aligning"
+                        self.book_progress.emit(92)
+                        self.status.emit(f"📚 {job.label}: aligning text to audio…")
+                    elif "Greedy alignment:" in line_clean and "matched" not in line_clean:
+                        self.book_progress.emit(95)
+                    elif "Successfully wrote" in line_clean:
+                        self.book_progress.emit(100)
+                        self.status.emit(f"📚 {job.label}: done.")
+            elif not is_srs and phase == "transcribing" and transcribe_start is not None:
                 elapsed = time.time() - transcribe_start
                 pct = min(int(elapsed / expected_transcribe * 90), 90)
                 self.book_progress.emit(pct)
@@ -306,8 +378,24 @@ class MainWindow(QWidget):
         # the most relevant one to reveal in Finder.
         self._last_output_dirs: list[Path] = []
 
+        # Action selector (what to do with the audio+text pair)
+        self.action_sync = QRadioButton("Sync subtitles (audio + epub/txt → SRT)")
+        self.action_srs = QRadioButton("Build Anki deck (audio + SRT → .apkg)")
+        self.action_sync.setChecked(True)
+        action_group = QButtonGroup(self)
+        action_group.addButton(self.action_sync)
+        action_group.addButton(self.action_srs)
+        self.action_sync.toggled.connect(self._on_action_changed)
+
+        action_box = QGroupBox("Action")
+        ab = QHBoxLayout()
+        ab.addWidget(self.action_sync)
+        ab.addWidget(self.action_srs)
+        ab.addStretch()
+        action_box.setLayout(ab)
+
         # Mode selector
-        self.mode_single = QRadioButton("Single pair (one audio + one epub)")
+        self.mode_single = QRadioButton("Single pair")
         self.mode_folder = QRadioButton("Folder (auto-detect pairs)")
         self.mode_single.setChecked(True)
         mode_group = QButtonGroup(self)
@@ -380,7 +468,7 @@ class MainWindow(QWidget):
         self.mlx_check = QCheckBox("Use MLX (Apple Metal + Neural Engine)")
         self.mlx_check.setChecked(True)
 
-        settings = QGroupBox("Settings")
+        self.settings_sync = QGroupBox("Sync settings")
         sg = QHBoxLayout()
         sg.addWidget(QLabel("Model:"))
         sg.addWidget(self.model_combo)
@@ -390,7 +478,56 @@ class MainWindow(QWidget):
         sg.addSpacing(20)
         sg.addWidget(self.mlx_check)
         sg.addStretch()
-        settings.setLayout(sg)
+        self.settings_sync.setLayout(sg)
+
+        # SRS settings (visible only when action = Build Anki deck)
+        self.pad_ms_edit = QLineEdit("200")
+        self.pad_ms_edit.setMaximumWidth(60)
+        self.fade_ms_edit = QLineEdit("10")
+        self.fade_ms_edit.setMaximumWidth(60)
+        self.vad_check_box = QCheckBox("VAD edge check")
+        self.vad_check_box.setChecked(True)
+        self.cover_box = QCheckBox("Embed cover art")
+        self.cover_box.setChecked(True)
+        # "auto" means match source bitrate/channels; user can override.
+        self.bitrate_edit = QLineEdit("auto")
+        self.bitrate_edit.setMaximumWidth(70)
+        self.channels_combo = QComboBox()
+        self.channels_combo.addItems(["auto", "mono", "stereo"])
+        self.srs_output_edit = QLineEdit()
+        self.srs_output_edit.setPlaceholderText("Output folder (default: next to audio file)")
+        srs_output_btn = QPushButton("Browse…")
+        srs_output_btn.clicked.connect(self._pick_srs_output)
+
+        self.settings_srs = QGroupBox("Anki deck settings")
+        srs_layout = QVBoxLayout()
+        srs_row1 = QHBoxLayout()
+        srs_row1.addWidget(QLabel("Pad (ms):"))
+        srs_row1.addWidget(self.pad_ms_edit)
+        srs_row1.addSpacing(15)
+        srs_row1.addWidget(QLabel("Fade (ms):"))
+        srs_row1.addWidget(self.fade_ms_edit)
+        srs_row1.addSpacing(15)
+        srs_row1.addWidget(self.vad_check_box)
+        srs_row1.addSpacing(15)
+        srs_row1.addWidget(self.cover_box)
+        srs_row1.addStretch()
+        srs_row2 = QHBoxLayout()
+        srs_row2.addWidget(QLabel("Bitrate:"))
+        srs_row2.addWidget(self.bitrate_edit)
+        srs_row2.addSpacing(15)
+        srs_row2.addWidget(QLabel("Channels:"))
+        srs_row2.addWidget(self.channels_combo)
+        srs_row2.addStretch()
+        srs_row3 = QHBoxLayout()
+        srs_row3.addWidget(QLabel("Output:"))
+        srs_row3.addWidget(self.srs_output_edit, 1)
+        srs_row3.addWidget(srs_output_btn)
+        srs_layout.addLayout(srs_row1)
+        srs_layout.addLayout(srs_row2)
+        srs_layout.addLayout(srs_row3)
+        self.settings_srs.setLayout(srs_layout)
+        self.settings_srs.setVisible(False)
 
         # Progress + status
         self.status_label = QLabel("Ready.")
@@ -427,10 +564,12 @@ class MainWindow(QWidget):
         self.log_view.setMinimumHeight(160)
 
         root = QVBoxLayout()
+        root.addWidget(action_box)
         root.addWidget(mode_box)
         root.addWidget(self.single_box)
         root.addWidget(self.folder_box)
-        root.addWidget(settings)
+        root.addWidget(self.settings_sync)
+        root.addWidget(self.settings_srs)
         root.addWidget(self.status_label)
         root.addWidget(self.book_bar)
         root.addWidget(self.batch_label)
@@ -512,6 +651,23 @@ class MainWindow(QWidget):
         self.single_box.setVisible(is_single)
         self.folder_box.setVisible(not is_single)
 
+    def _on_action_changed(self):
+        is_srs = self.action_srs.isChecked()
+        self.settings_sync.setVisible(not is_srs)
+        self.settings_srs.setVisible(is_srs)
+        # Folder detection rules change with action; refresh preview.
+        self._refresh_folder_preview()
+        # Hint placeholder text on the text field
+        if is_srs:
+            self.text_edit.setPlaceholderText("Path to SRT/VTT/ASS file (the subtitle source)")
+        else:
+            self.text_edit.setPlaceholderText("Path to epub/txt file")
+
+    def _pick_srs_output(self):
+        p = QFileDialog.getExistingDirectory(self, "Choose output folder for .apkg")
+        if p:
+            self.srs_output_edit.setText(p)
+
     def _pick_audio(self):
         p, _ = QFileDialog.getOpenFileName(
             self, "Select audio file", "",
@@ -521,10 +677,13 @@ class MainWindow(QWidget):
             self.audio_edit.setText(p)
 
     def _pick_text(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Select epub or text file", "",
-            "Text (*.epub *.txt *.srt *.vtt *.ass);;All files (*)"
-        )
+        if self.action_srs.isChecked():
+            caption = "Select subtitle file"
+            filt = "Subtitles (*.srt *.vtt *.ass);;All files (*)"
+        else:
+            caption = "Select epub or text file"
+            filt = "Text (*.epub *.txt *.srt *.vtt *.ass);;All files (*)"
+        p, _ = QFileDialog.getOpenFileName(self, caption, "", filt)
         if p:
             self.text_edit.setText(p)
 
@@ -538,13 +697,15 @@ class MainWindow(QWidget):
         if not folder:
             self.folder_preview.setText("")
             return
+        exts = SRS_TEXT_EXTS if self.action_srs.isChecked() else TEXT_EXTS
         try:
-            pairs = detect_pairs(Path(folder))
+            pairs = detect_pairs(Path(folder), exts)
         except Exception as e:
             self.folder_preview.setText(f"⚠️  Couldn't scan folder: {e}")
             return
         if not pairs:
-            self.folder_preview.setText("⚠️  No audio+text pairs detected.")
+            kind = "audio+subtitle" if self.action_srs.isChecked() else "audio+text"
+            self.folder_preview.setText(f"⚠️  No {kind} pairs detected.")
             return
         first = ", ".join(p.label for p in pairs[:3])
         more = f" (+{len(pairs)-3} more)" if len(pairs) > 3 else ""
@@ -563,11 +724,31 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Nothing to do", "No audiobook/text pairs were found.")
             return
 
+        action = "srs" if self.action_srs.isChecked() else "sync"
         opts = {
+            "action": action,
             "model": self.model_combo.currentText(),
             "lang": self.lang_edit.text().strip() or "ja",
             "mlx": self.mlx_check.isChecked(),
         }
+        if action == "srs":
+            # Validate pad/fade are integers and non-negative; fall back to defaults
+            # if the user typed something weird.
+            try:
+                opts["srs_pad_ms"] = max(0, int(self.pad_ms_edit.text().strip() or "200"))
+            except ValueError:
+                opts["srs_pad_ms"] = 200
+            try:
+                opts["srs_fade_ms"] = max(0, int(self.fade_ms_edit.text().strip() or "10"))
+            except ValueError:
+                opts["srs_fade_ms"] = 10
+            opts["srs_vad_check"] = self.vad_check_box.isChecked()
+            opts["srs_cover"] = self.cover_box.isChecked()
+            opts["srs_bitrate"] = self.bitrate_edit.text().strip() or "auto"
+            opts["srs_channels"] = self.channels_combo.currentText()
+            out = self.srs_output_edit.text().strip()
+            if out:
+                opts["srs_output_dir"] = out
 
         self.log_view.clear()
         self.batch_label.setText(f"Batch: 0 / {len(jobs)} books")
@@ -575,12 +756,17 @@ class MainWindow(QWidget):
         self.batch_bar.setValue(0)
         self.status_label.setText(f"Starting — {len(jobs)} book(s) queued…")
 
-        # Record output folders for the "Open folder" button. For -d mode it's
-        # the workdir; for explicit --audio mode it's the audio's parent.
-        self._last_output_dirs = [
-            job.workdir if job.workdir is not None else job.audio.parent
-            for job in jobs
-        ]
+        # Record output folders for the "Open folder" button. For sync's -d
+        # mode it's the workdir; for explicit --audio mode (and srs) it's the
+        # audio's parent — unless srs has an explicit output dir set.
+        srs_out = opts.get("srs_output_dir") if action == "srs" else None
+        if srs_out:
+            self._last_output_dirs = [Path(srs_out)] * len(jobs)
+        else:
+            self._last_output_dirs = [
+                job.workdir if (job.workdir is not None and action != "srs") else job.audio.parent
+                for job in jobs
+            ]
         self.open_folder_btn.setEnabled(False)
 
         self.run_btn.setEnabled(False)
@@ -625,7 +811,8 @@ class MainWindow(QWidget):
             folder = self.folder_edit.text().strip()
             if not folder or not Path(folder).exists():
                 return []
-            return detect_pairs(Path(folder))
+            exts = SRS_TEXT_EXTS if self.action_srs.isChecked() else TEXT_EXTS
+            return detect_pairs(Path(folder), exts)
 
     def _append_log(self, line: str):
         # Trim to keep the widget responsive on long runs
@@ -665,13 +852,14 @@ class MainWindow(QWidget):
         """
         if not self._last_output_dirs:
             return
+        # Reveal an .apkg if we just built one; otherwise an .srt; else the dir.
+        revealed_glob = "*.apkg" if self.action_srs.isChecked() else "*.srt"
         opened: set[str] = set()
         for d in self._last_output_dirs:
             if not d.exists():
                 continue
-            # Look for an SRT inside this dir to reveal a concrete file.
-            srts = sorted(d.glob("*.srt"), key=lambda p: p.stat().st_mtime, reverse=True)
-            target = srts[0] if srts else d
+            hits = sorted(d.glob(revealed_glob), key=lambda p: p.stat().st_mtime, reverse=True)
+            target = hits[0] if hits else d
             key = str(target)
             if key in opened:
                 continue

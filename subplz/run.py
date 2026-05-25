@@ -6,6 +6,7 @@ from .helpers import find, rename, copy, extract
 from .batch import run_batch
 from .sync import run_sync
 from .gen import run_gen
+from .srs import run_srs
 
 # --- CHANGED: We now import get_args and create_structured_inputs separately ---
 from .cli import get_args, get_inputs
@@ -35,6 +36,7 @@ def execute_on_inputs():
         "batch": run_batch,
         "sync": run_sync,
         "gen": run_gen,
+        "srs": run_srs,
     }
 
     handler_function = COMMAND_MAP.get(inputs.subcommand)

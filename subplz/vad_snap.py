@@ -21,19 +21,19 @@ from pathlib import Path
 from typing import Optional
 
 
-def _ensure_vad_model():
+def ensure_vad_model():
     """Lazy-load silero-vad. Cached after first call."""
-    if not hasattr(_ensure_vad_model, "_model"):
+    if not hasattr(ensure_vad_model, "_model"):
         from silero_vad import load_silero_vad
-        _ensure_vad_model._model = load_silero_vad()
-    return _ensure_vad_model._model
+        ensure_vad_model._model = load_silero_vad()
+    return ensure_vad_model._model
 
 
-def _get_speech_timestamps(audio_path: str, threshold: float = 0.5):
+def get_speech_timestamps_for_file(audio_path: str, threshold: float = 0.5):
     """Run silero-vad over a whole audio file. Returns sorted list of
     `(start_sec, end_sec)` speech segments."""
     from silero_vad import read_audio, get_speech_timestamps
-    model = _ensure_vad_model()
+    model = ensure_vad_model()
     wav = read_audio(audio_path, sampling_rate=16000)
     ts = get_speech_timestamps(
         wav,
@@ -45,6 +45,43 @@ def _get_speech_timestamps(audio_path: str, threshold: float = 0.5):
         # min_silence_duration_ms=100,
     )
     return [(float(t["start"]), float(t["end"])) for t in ts]
+
+
+# Back-compat alias for any existing internal callers.
+_get_speech_timestamps = get_speech_timestamps_for_file
+
+
+def is_speech_at_edges(
+    audio_path: str,
+    edge_ms: float = 30.0,
+    threshold: float = 0.5,
+) -> tuple[bool, bool]:
+    """Check whether speech is active at the very start and end of an audio
+    file. Returns `(speech_at_start, speech_at_end)`.
+
+    A `True` for either edge means the cut likely chopped a word — the
+    speaker was still talking when the clip began or ended. Caller can
+    respond by extending the pad and re-slicing.
+
+    `edge_ms` is the tolerance window: any VAD-detected speech overlapping
+    the first/last `edge_ms` milliseconds counts as "active at the edge".
+    """
+    from silero_vad import read_audio
+    model = ensure_vad_model()
+    wav = read_audio(audio_path, sampling_rate=16000)
+    duration = len(wav) / 16000.0
+    if duration <= 0:
+        return (False, False)
+
+    from silero_vad import get_speech_timestamps
+    ts = get_speech_timestamps(wav, model, threshold=threshold, return_seconds=True)
+    if not ts:
+        return (False, False)
+
+    edge_s = edge_ms / 1000.0
+    speech_at_start = any(float(t["start"]) < edge_s for t in ts)
+    speech_at_end = any(float(t["end"]) > duration - edge_s for t in ts)
+    return (speech_at_start, speech_at_end)
 
 
 def _snap_to_speech(t: float, transitions: list[float], tolerance: float) -> float:
@@ -98,7 +135,7 @@ def vad_snap_cues(
     if not cues or not Path(audio_path).exists():
         return 0
 
-    speech_segments = _get_speech_timestamps(audio_path)
+    speech_segments = get_speech_timestamps_for_file(audio_path)
     if not speech_segments:
         return 0
 

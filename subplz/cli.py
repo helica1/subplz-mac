@@ -533,6 +533,78 @@ ARGUMENTS = {
             "help": "Number of batches to operate on",
         },
     },
+    "pad_ms": {
+        "flags": ["--pad-ms"],
+        "kwargs": {
+            "type": int,
+            "default": 200,
+            "help": "Milliseconds of audio to keep before/after each subtitle cue (default: 200)",
+        },
+    },
+    "fade_ms": {
+        "flags": ["--fade-ms"],
+        "kwargs": {
+            "type": int,
+            "default": 10,
+            "help": "Fade in/out duration in ms applied to each clip to avoid clicks (default: 10, set 0 to disable)",
+        },
+    },
+    "vad_check": {
+        "flags": ["--vad-check"],
+        "kwargs": {
+            "default": True,
+            "help": "After slicing, verify with silero-vad that no clip starts/ends mid-word; auto-retry with extra pad on failures. Use --no-vad-check to skip.",
+            "action": argparse.BooleanOptionalAction,
+        },
+    },
+    "codec": {
+        "flags": ["--codec"],
+        "kwargs": {
+            "type": str,
+            "default": "libmp3lame",
+            "help": "ffmpeg audio codec for clips (default: libmp3lame — universally supported by Anki/AnkiDroid). Other options: libopus (smaller, spotty Android support), aac.",
+        },
+    },
+    "bitrate": {
+        "flags": ["--bitrate"],
+        "kwargs": {
+            "type": str,
+            "default": "auto",
+            "help": "Audio bitrate for clips (default: auto — match the source's bitrate, capped at 192k). Override with e.g. '96k'.",
+        },
+    },
+    "channels": {
+        "flags": ["--channels"],
+        "kwargs": {
+            "type": str,
+            "default": "auto",
+            "help": "Channel layout for clips (default: auto — match the source). Accepts 'mono', 'stereo', or a number.",
+        },
+    },
+    "cover": {
+        "flags": ["--cover"],
+        "kwargs": {
+            "default": True,
+            "help": "Extract embedded cover art from the audio file and use it as a card image. Use --no-cover to skip.",
+            "action": argparse.BooleanOptionalAction,
+        },
+    },
+    "deck_name": {
+        "flags": ["--deck-name"],
+        "kwargs": {
+            "type": str,
+            "default": None,
+            "help": "Anki deck name (default: derived from audio filename)",
+        },
+    },
+    "keep_media": {
+        "flags": ["--keep-media"],
+        "kwargs": {
+            "default": False,
+            "action": "store_true",
+            "help": "Keep the loose media folder next to the .apkg (default: deleted, everything is inside the .apkg)",
+        },
+    },
 }
 
 
@@ -725,6 +797,24 @@ class ExtractParams:
 
 
 @dataclass
+class SrsParams:
+    subcommand: str = field(metadata={"category": "main"})
+    audio: str = field(metadata={"category": "main"})
+    text: str = field(metadata={"category": "main"})
+    output_dir: str = field(metadata={"category": "main"})
+    pad_ms: int = field(default=200, metadata={"category": "optional"})
+    fade_ms: int = field(default=10, metadata={"category": "optional"})
+    vad_check: bool = field(default=True, metadata={"category": "optional"})
+    cover: bool = field(default=True, metadata={"category": "optional"})
+    codec: str = field(default="libmp3lame", metadata={"category": "optional"})
+    bitrate: str = field(default="auto", metadata={"category": "optional"})
+    channels: str = field(default="auto", metadata={"category": "optional"})
+    deck_name: Optional[str] = field(default=None, metadata={"category": "optional"})
+    keep_media: bool = field(default=False, metadata={"category": "optional"})
+    config: Optional[str] = field(default=None, metadata={"category": "optional"})
+
+
+@dataclass
 class BatchParams:
     subcommand: str = field(metadata={"category": "main"})
     dirs: List[str] = field(metadata={"category": "optional"})
@@ -849,6 +939,18 @@ def setup_commands_cli(parser):
         ExtractParams,
         optional_group_extract,
         advanced_group_extract,
+    )
+
+    srs = sp.add_parser(
+        "srs",
+        help="Build an Anki .apkg deck from an audio file + SRT (subs2srs-style)",
+        usage="subplz srs --audio AUDIO --text SRT --output-dir DIR [--pad-ms 200] [--fade-ms 10] [--no-vad-check]",
+    )
+    main_group_srs = srs.add_argument_group("Main arguments")
+    optional_group_srs = srs.add_argument_group("Optional arguments")
+    advanced_group_srs = srs.add_argument_group("Advanced arguments")
+    add_arguments_from_dataclass(
+        main_group_srs, SrsParams, optional_group_srs, advanced_group_srs
     )
 
     batch = sp.add_parser(

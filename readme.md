@@ -62,6 +62,25 @@ Drag and drop a single audio + epub pair, or drop a folder of audiobook subfolde
 
 ---
 
+## 📦 Build Anki decks (`srs`)
+
+Turn an audio file + SRT into a standalone `.apkg` you can transfer to AnkiDroid (no AnkiConnect, no Anki sync). Each subtitle cue becomes one note: audio clip on the front, sentence on the back, audiobook cover as the card image.
+
+```bash
+.venv/bin/subplz srs \
+  --audio "/path/to/book.mp3" \
+  --text  "/path/to/book.srt" \
+  --output-dir "/path/to/output"
+```
+
+Defaults are tuned for Japanese audiobook sentence-mining: 200 ms pad on each cue, 10 ms fade in/out to avoid clicks, silero-vad edge-check to retry clips that chop a word, and audio bitrate/channels auto-matched to the source (capped at 192 k). MP3 is the codec default — AnkiDroid plays it everywhere; Opus is hit-or-miss across Android versions.
+
+Useful flags: `--pad-ms`, `--fade-ms`, `--no-vad-check`, `--bitrate auto|96k|…`, `--channels auto|mono|stereo`, `--no-cover`, `--deck-name`. The GUI's "Build Anki deck" action exposes the same options.
+
+Install: `.venv/bin/pip install -e ".[srs]"` (already included in `[mac]`).
+
+---
+
 ## 🎛️ Flags worth knowing
 
 - `--mlx` — use MLX-Whisper backend. Apple Silicon only. Vastly faster than CPU; recommended.
@@ -114,6 +133,7 @@ For general SubPlz support and the upstream community, see [KanjiEater's Discord
 - Char-rate rebalance: redistributes audio between adjacent cues when Whisper's segmentation gives one sub way more audio than its text justifies.
 - Epub front/back matter filters: drops title pages, copyright disclaimers, table-of-contents, colophon, author bios.
 - PySide6 drag-and-drop GUI with batch mode, progress bars, and an "Open output folder" reveal-in-Finder action.
+- `subplz srs` subcommand: builds standalone Anki `.apkg` from audio + SRT (subs2srs-style). ffmpeg slicing with pad + fade, VAD edge-check, auto-matched bitrate/channels, embedded cover art, soft-skip on per-clip ffmpeg failures.
 
 ## License
 

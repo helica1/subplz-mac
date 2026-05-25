@@ -78,12 +78,20 @@ vad = [
 gui = [
   "PySide6>=6.10",
 ]
+# SRS deck export (`subplz srs`): slice audio by SRT cues and build a
+# standalone .apkg you can drop onto AnkiDroid without AnkiConnect/sync.
+srs = [
+  "genanki>=0.13.1",
+  "srt>=3.5.3",
+]
 # Convenience: everything Mac users typically want.
 mac = [
   "mlx-whisper>=0.4.3",
   "silero-vad>=6.0.0",
   "torchcodec>=0.10",
   "PySide6>=6.10",
+  "genanki>=0.13.1",
+  "srt>=3.5.3",
 ]
 
 [project.scripts]
