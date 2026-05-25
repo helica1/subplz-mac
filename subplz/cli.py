@@ -585,8 +585,16 @@ ARGUMENTS = {
         "flags": ["--cover"],
         "kwargs": {
             "default": True,
-            "help": "Extract embedded cover art from the audio file and use it as a card image. Use --no-cover to skip.",
+            "help": "Extract a card image via the cover-fallback chain (embedded → sidecar → epub). Use --no-cover to skip.",
             "action": argparse.BooleanOptionalAction,
+        },
+    },
+    "cover_image": {
+        "flags": ["--cover-image"],
+        "kwargs": {
+            "type": str,
+            "default": None,
+            "help": "Explicit path to an image file (jpg/png) to use as the card cover. Overrides the auto-detected chain.",
         },
     },
     "deck_name": {
@@ -806,6 +814,7 @@ class SrsParams:
     fade_ms: int = field(default=10, metadata={"category": "optional"})
     vad_check: bool = field(default=True, metadata={"category": "optional"})
     cover: bool = field(default=True, metadata={"category": "optional"})
+    cover_image: Optional[str] = field(default=None, metadata={"category": "optional"})
     codec: str = field(default="libmp3lame", metadata={"category": "optional"})
     bitrate: str = field(default="auto", metadata={"category": "optional"})
     channels: str = field(default="auto", metadata={"category": "optional"})

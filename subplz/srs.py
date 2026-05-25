@@ -226,18 +226,14 @@ def _resolve_codec_params(
     return br_str, ch
 
 
-def _extract_cover(audio_path: Path, out_path: Path) -> Optional[Path]:
+def _extract_embedded_cover(audio_path: Path, out_path: Path) -> Optional[Path]:
     """Pull embedded cover art from an audio file. Returns the path to the
     written image on success, or None if there's no cover (or ffmpeg fails).
 
     Works for ID3 APIC frames (mp3), MP4 cover atoms (m4b/m4a), and FLAC
-    pictures. We just ask ffmpeg to copy the attached picture stream out;
-    it figures out the format. Output extension determines the encoding
-    (jpg/png — we use jpg so it stays small in the .apkg).
+    pictures. CBR re-encodes often strip these — see [[the cover-fallback
+    chain in run_srs]] for what we try next when this returns None.
     """
-    # `-an` strips audio; `-vcodec copy` keeps the original picture if it's
-    # already jpeg/png. For non-jpeg sources, ffmpeg transcodes to jpg via
-    # the output extension.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(audio_path),
@@ -251,6 +247,134 @@ def _extract_cover(audio_path: Path, out_path: Path) -> Optional[Path]:
     if out_path.exists() and out_path.stat().st_size > 0:
         return out_path
     return None
+
+
+# Suffixes commonly appended by audiobook re-encoders. Strip them when
+# matching audio stems against epub/image siblings.
+_AUDIO_RECODE_SUFFIXES = ("-cbr", "_cbr", "-vbr", "_vbr", "-converted")
+
+
+def _normalize_stem(stem: str) -> str:
+    """Lowercase + strip common re-encode suffixes for fuzzy sibling matching."""
+    s = stem.lower()
+    for suf in _AUDIO_RECODE_SUFFIXES:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    return s
+
+
+def _find_sidecar_image(audio_path: Path) -> Optional[Path]:
+    """Look for an image file next to the audio. Tries (in order):
+    - `<audio-stem>.jpg|.png|.jpeg`
+    - `cover.jpg|.png|.jpeg`
+    - `folder.jpg|.png|.jpeg`
+    """
+    parent = audio_path.parent
+    stem_candidates = [audio_path.stem, "cover", "folder"]
+    for name in stem_candidates:
+        for ext in (".jpg", ".jpeg", ".png"):
+            p = parent / f"{name}{ext}"
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+    return None
+
+
+def _find_epub_cover(audio_path: Path, out_path: Path) -> Optional[Path]:
+    """If there's an epub in the audio's directory whose stem fuzzy-matches
+    the audio's stem (after stripping common -cbr-style suffixes), extract
+    its cover image to `out_path` and return it.
+
+    Uses EbookLib (already a sync-pipeline dep) — checks ITEM_COVER first,
+    then falls back to any item with id 'cover' or a metadata cover ref.
+    """
+    parent = audio_path.parent
+    audio_key = _normalize_stem(audio_path.stem)
+    all_epubs = list(parent.glob("*.epub"))
+    candidates: list[Path] = []
+    for p in all_epubs:
+        epub_key = _normalize_stem(p.stem)
+        if epub_key == audio_key or audio_key.startswith(epub_key) or epub_key.startswith(audio_key):
+            candidates.append(p)
+    # If no stem match but the folder has exactly one epub, assume it's the
+    # pair. Avoids surprising the user when names don't line up (e.g. their
+    # SRT and audio share a stem but the epub has a different label).
+    if not candidates and len(all_epubs) == 1:
+        candidates = all_epubs
+    if not candidates:
+        return None
+
+    try:
+        from ebooklib import epub, ITEM_COVER, ITEM_IMAGE
+    except ImportError:
+        return None
+
+    for epub_path in candidates:
+        try:
+            book = epub.read_epub(str(epub_path), options={"ignore_ncx": True})
+        except Exception:
+            continue
+        # 1. Explicit ITEM_COVER (EPUB3-style)
+        for item in book.get_items_of_type(ITEM_COVER):
+            data = item.get_content()
+            if data:
+                out_path.write_bytes(data)
+                return out_path
+        # 2. <meta name="cover" content="..."> → item lookup (EPUB2-style)
+        cover_id = None
+        for meta in book.get_metadata("OPF", "meta") or []:
+            attrs = meta[1] if len(meta) > 1 else {}
+            if attrs.get("name") == "cover":
+                cover_id = attrs.get("content")
+                break
+        if cover_id:
+            item = book.get_item_with_id(cover_id)
+            if item is not None and item.get_content():
+                out_path.write_bytes(item.get_content())
+                return out_path
+        # 3. Fallback: any image whose filename hints "cover"
+        for item in book.get_items_of_type(ITEM_IMAGE):
+            name_lower = (item.get_name() or "").lower()
+            if "cover" in name_lower:
+                out_path.write_bytes(item.get_content())
+                return out_path
+    return None
+
+
+def _resolve_cover(
+    audio_path: Path,
+    out_path: Path,
+    explicit: Optional[str],
+) -> tuple[Optional[Path], str]:
+    """Try the full cover-resolution chain. Returns (path or None, source).
+
+    Source string is for the log so the user knows which fallback fired:
+    'explicit', 'embedded', 'sidecar', 'epub', or 'none'.
+    """
+    if explicit:
+        explicit_path = Path(explicit).expanduser().resolve()
+        if explicit_path.is_file():
+            # Copy into the media dir so the .apkg references a stable filename
+            # alongside the other clips. Keep the source's extension.
+            out_with_ext = out_path.with_suffix(explicit_path.suffix.lower() or ".jpg")
+            shutil.copyfile(explicit_path, out_with_ext)
+            return out_with_ext, "explicit"
+
+    embedded = _extract_embedded_cover(audio_path, out_path)
+    if embedded is not None:
+        return embedded, "embedded"
+
+    sidecar = _find_sidecar_image(audio_path)
+    if sidecar is not None:
+        out_with_ext = out_path.with_suffix(sidecar.suffix.lower())
+        shutil.copyfile(sidecar, out_with_ext)
+        return out_with_ext, f"sidecar ({sidecar.name})"
+
+    epub_cover = _find_epub_cover(audio_path, out_path)
+    if epub_cover is not None:
+        return epub_cover, "epub"
+
+    return None, "none"
 
 
 def _slugify(s: str) -> str:
@@ -395,17 +519,25 @@ def run_srs(inputs):
     media_dir = output_dir / f"{_slugify(deck_name)}_media"
     media_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pull embedded cover art (album art / book cover) from the audio file,
-    # if any. Used as a per-card image so the deck has visual identity
-    # even though the source is audio-only.
+    # Resolve a card image via the cover-fallback chain:
+    # 1. --cover-image PATH (explicit user override)
+    # 2. Embedded ID3 APIC / MP4 cover atom in the audio file
+    # 3. Sidecar image next to audio: <stem>.jpg, cover.jpg, folder.jpg
+    # 4. Cover from a sibling .epub with a fuzzy-matched stem
     cover_path: Optional[Path] = None
     if getattr(inputs, "cover", True):
         cover_candidate = media_dir / f"cover_{_slugify(deck_name)}.jpg"
-        cover_path = _extract_cover(audio_path, cover_candidate)
+        cover_path, source = _resolve_cover(
+            audio_path, cover_candidate, getattr(inputs, "cover_image", None)
+        )
         if cover_path is not None:
-            logger.info(f"🖼  Extracted cover art ({cover_path.stat().st_size // 1024} KB)")
+            size_kb = cover_path.stat().st_size // 1024
+            logger.info(f"🖼  Cover art: {source} ({size_kb} KB)")
         else:
-            logger.info("🖼  No embedded cover art found; cards will have no image.")
+            logger.info(
+                "🖼  No cover found. Tried: embedded → sidecar (cover.jpg/folder.jpg/<stem>.jpg) → "
+                "epub sibling. Pass --cover-image PATH to point at one explicitly."
+            )
 
     pad_s = pad_ms / 1000.0
     clip_paths: dict[int, Path] = {}

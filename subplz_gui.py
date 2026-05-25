@@ -228,6 +228,9 @@ class SyncWorker(QObject):
             cmd.append("--no-vad-check")
         if not self.opts.get("srs_cover", True):
             cmd.append("--no-cover")
+        cover_img = self.opts.get("srs_cover_image")
+        if cover_img:
+            cmd += ["--cover-image", cover_img]
         # "auto" is the CLI default; only emit when the user changed it, to
         # keep the command line readable in the log.
         br = self.opts.get("srs_bitrate", "auto")
@@ -489,6 +492,10 @@ class MainWindow(QWidget):
         self.vad_check_box.setChecked(True)
         self.cover_box = QCheckBox("Embed cover art")
         self.cover_box.setChecked(True)
+        self.cover_image_edit = QLineEdit()
+        self.cover_image_edit.setPlaceholderText("Optional: path to a cover image (overrides auto-detection)")
+        cover_image_btn = QPushButton("Browse…")
+        cover_image_btn.clicked.connect(self._pick_cover_image)
         # "auto" means match source bitrate/channels; user can override.
         self.bitrate_edit = QLineEdit("auto")
         self.bitrate_edit.setMaximumWidth(70)
@@ -520,12 +527,17 @@ class MainWindow(QWidget):
         srs_row2.addWidget(self.channels_combo)
         srs_row2.addStretch()
         srs_row3 = QHBoxLayout()
-        srs_row3.addWidget(QLabel("Output:"))
-        srs_row3.addWidget(self.srs_output_edit, 1)
-        srs_row3.addWidget(srs_output_btn)
+        srs_row3.addWidget(QLabel("Cover image:"))
+        srs_row3.addWidget(self.cover_image_edit, 1)
+        srs_row3.addWidget(cover_image_btn)
+        srs_row4 = QHBoxLayout()
+        srs_row4.addWidget(QLabel("Output:"))
+        srs_row4.addWidget(self.srs_output_edit, 1)
+        srs_row4.addWidget(srs_output_btn)
         srs_layout.addLayout(srs_row1)
         srs_layout.addLayout(srs_row2)
         srs_layout.addLayout(srs_row3)
+        srs_layout.addLayout(srs_row4)
         self.settings_srs.setLayout(srs_layout)
         self.settings_srs.setVisible(False)
 
@@ -668,6 +680,14 @@ class MainWindow(QWidget):
         if p:
             self.srs_output_edit.setText(p)
 
+    def _pick_cover_image(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Choose cover image", "",
+            "Images (*.jpg *.jpeg *.png);;All files (*)",
+        )
+        if p:
+            self.cover_image_edit.setText(p)
+
     def _pick_audio(self):
         p, _ = QFileDialog.getOpenFileName(
             self, "Select audio file", "",
@@ -744,6 +764,7 @@ class MainWindow(QWidget):
                 opts["srs_fade_ms"] = 10
             opts["srs_vad_check"] = self.vad_check_box.isChecked()
             opts["srs_cover"] = self.cover_box.isChecked()
+            opts["srs_cover_image"] = self.cover_image_edit.text().strip()
             opts["srs_bitrate"] = self.bitrate_edit.text().strip() or "auto"
             opts["srs_channels"] = self.channels_combo.currentText()
             out = self.srs_output_edit.text().strip()
