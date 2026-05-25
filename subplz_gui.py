@@ -179,35 +179,6 @@ class SyncWorker(QObject):
             except Exception:
                 pass
 
-    def _build_cmd(self, job: Job) -> list[str]:
-        if self.opts.get("action") == "srs":
-            return self._build_srs_cmd(job)
-        cmd = [
-            str(SUBPLZ_BIN),
-            "sync",
-            "--lang",
-            self.opts["lang"],
-            "--model",
-            self.opts["model"],
-            "--respect-grouping",
-            "--overwrite",
-            "--rerun",
-        ]
-        if self.opts.get("mlx"):
-            cmd.append("--mlx")
-        if job.workdir is not None:
-            cmd += ["-d", str(job.workdir)]
-        else:
-            cmd += [
-                "--audio",
-                str(job.audio),
-                "--text",
-                str(job.text),
-                "--output-dir",
-                str(job.audio.parent),
-            ]
-        return cmd
-
     def _build_srs_cmd(self, job: Job) -> list[str]:
         out_dir = self.opts.get("srs_output_dir") or str(job.audio.parent)
         cmd = [
@@ -266,12 +237,93 @@ class SyncWorker(QObject):
         self.all_done.emit()
 
     def _run_one(self, job: Job):
+        """Run all subprocess phases for a single job.
+
+        Dispatches by `action`:
+        - sync: one `subplz sync` invocation, progress 0-100
+        - srs: one `subplz srs` invocation, progress 0-100
+        - both: chained sync (0-50) then srs (50-100), with the SRT produced
+          by sync auto-fed to srs as its `--text` input
+        """
+        action = self.opts.get("action") or "sync"
+        if action == "both":
+            self._run_phase(job, "sync", self._build_sync_cmd(job), 0, 50)
+            if self._should_stop:
+                return
+            srt = self._locate_synced_srt(job)
+            if srt is None:
+                raise RuntimeError(
+                    f"Sync finished but no SRT was found next to {job.audio.name}; "
+                    f"cannot continue to deck building."
+                )
+            self.log.emit(f"➡  Sync produced: {srt}")
+            srs_job = Job(label=job.label, audio=job.audio, text=srt, workdir=None)
+            self._run_phase(srs_job, "srs", self._build_srs_cmd(srs_job), 50, 100)
+        elif action == "srs":
+            self._run_phase(job, "srs", self._build_srs_cmd(job), 0, 100)
+        else:
+            self._run_phase(job, "sync", self._build_sync_cmd(job), 0, 100)
+
+    def _build_sync_cmd(self, job: Job) -> list[str]:
+        """Direct sync builder — used by both single-action sync and the
+        sync half of "both" mode. Mirrors the original _build_cmd's sync arm."""
+        cmd = [
+            str(SUBPLZ_BIN),
+            "sync",
+            "--lang", self.opts["lang"],
+            "--model", self.opts["model"],
+            "--respect-grouping",
+            "--overwrite",
+            "--rerun",
+        ]
+        if self.opts.get("mlx"):
+            cmd.append("--mlx")
+        if job.workdir is not None:
+            cmd += ["-d", str(job.workdir)]
+        else:
+            cmd += [
+                "--audio", str(job.audio),
+                "--text", str(job.text),
+                "--output-dir", str(job.audio.parent),
+            ]
+        return cmd
+
+    def _locate_synced_srt(self, job: Job) -> Optional[Path]:
+        """Find the SRT that sync just wrote. sync places it next to the
+        audio (or inside the workdir for `-d` mode) as `<stem>.srt` or
+        `<stem>.<lang-ext>.srt`. We glob and pick the newest non-internal
+        candidate so name variations don't trip us up."""
+        parent = job.workdir if job.workdir is not None else job.audio.parent
+        if not parent or not parent.exists():
+            return None
+        candidates = list(parent.glob(f"{job.audio.stem}*.srt"))
+        if not candidates:
+            candidates = list(parent.glob("*.srt"))
+        # Skip internal files sync writes alongside the real output
+        candidates = [
+            p for p in candidates
+            if not any(tag in p.name.lower() for tag in (".original.", ".subfail.", ".broken."))
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _run_phase(self, job: Job, kind: str, cmd: list[str], pct_start: int, pct_end: int):
+        """Run one subprocess (sync or srs) and stream-parse progress lines.
+
+        Per-phase progress (0-100) is rescaled into [pct_start, pct_end] so
+        chained phases stack cleanly on a single book progress bar.
+        """
+        def emit(frac: float):
+            """frac is 0-1 within phase; scaled to overall pct_start..pct_end."""
+            pct = pct_start + max(0.0, min(frac, 1.0)) * (pct_end - pct_start)
+            self.book_progress.emit(int(pct))
+
         # Estimate transcription duration based on backend (sync mode only).
         audio_dur = get_audio_duration(job.audio)
         ratio = REALTIME_RATIO_MLX if self.opts.get("mlx") else REALTIME_RATIO_CPU
         expected_transcribe = max(audio_dur / ratio, 5.0) if audio_dur > 0 else 60.0
 
-        cmd = self._build_cmd(job)
         self.log.emit(f"$ {' '.join(cmd)}")
         env = {**os.environ, "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"}
 
@@ -284,14 +336,11 @@ class SyncWorker(QObject):
             env=env,
         )
 
-        is_srs = self.opts.get("action") == "srs"
+        is_srs = kind == "srs"
         transcribe_start: Optional[float] = None
         phase = "starting"
-        # tqdm "cutting: 12%|...| 503/4177" — pulls current/total
         srs_progress_re = re.compile(r"(cutting|vad-check):\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)")
 
-        # select-based read so we can emit periodic time-based progress even
-        # when subprocess is silent during long MLX transcription.
         stdout = self._current_proc.stdout
         assert stdout is not None
         fd = stdout.fileno()
@@ -307,12 +356,10 @@ class SyncWorker(QObject):
                 if not line:
                     break
                 line = line.rstrip("\n")
-                # Strip ANSI escapes from the loguru-formatted lines
                 line_clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
                 self.log.emit(line_clean)
 
                 if is_srs:
-                    # srs phases: parse cues → cut clips → vad-check → write apkg
                     if "Parsed" in line_clean and "cues from" in line_clean:
                         self.status.emit(f"📚 {job.label}: parsed cues")
                     elif "Slicing" in line_clean and "clips" in line_clean:
@@ -322,21 +369,20 @@ class SyncWorker(QObject):
                         phase = "vad"
                         self.status.emit(f"📚 {job.label}: checking clip boundaries…")
                     elif "Wrote " in line_clean and ".apkg" in line_clean:
-                        self.book_progress.emit(100)
+                        emit(1.0)
                         self.status.emit(f"📚 {job.label}: deck written.")
                     else:
                         m = srs_progress_re.search(line_clean)
                         if m:
-                            kind, cur, total = m.group(1), int(m.group(2)), int(m.group(3))
+                            kind_tqdm, cur, total = m.group(1), int(m.group(2)), int(m.group(3))
                             if total > 0:
-                                frac = cur / total
-                                # Cutting takes the first 45%, vad-check the next 50%, pkg the last 5%
-                                if kind == "cutting":
-                                    self.book_progress.emit(int(frac * 45))
+                                frac_in_phase = cur / total
+                                # Cutting: phase 0-45%, vad-check: phase 45-95%
+                                if kind_tqdm == "cutting":
+                                    emit(frac_in_phase * 0.45)
                                 else:
-                                    self.book_progress.emit(45 + int(frac * 50))
+                                    emit(0.45 + frac_in_phase * 0.50)
                 else:
-                    # sync phases (unchanged)
                     if "MLX-Whisper backend" in line_clean or "Transcribing with" in line_clean or "Attempting transcription" in line_clean:
                         if transcribe_start is None:
                             transcribe_start = time.time()
@@ -344,23 +390,23 @@ class SyncWorker(QObject):
                             self.status.emit(f"📚 {job.label}: transcribing audio…")
                     elif "Transcribing took:" in line_clean:
                         phase = "aligning"
-                        self.book_progress.emit(92)
+                        emit(0.92)
                         self.status.emit(f"📚 {job.label}: aligning text to audio…")
                     elif "Greedy alignment:" in line_clean and "matched" not in line_clean:
-                        self.book_progress.emit(95)
+                        emit(0.95)
                     elif "Successfully wrote" in line_clean:
-                        self.book_progress.emit(100)
-                        self.status.emit(f"📚 {job.label}: done.")
+                        emit(1.0)
+                        self.status.emit(f"📚 {job.label}: sub written.")
             elif not is_srs and phase == "transcribing" and transcribe_start is not None:
                 elapsed = time.time() - transcribe_start
-                pct = min(int(elapsed / expected_transcribe * 90), 90)
-                self.book_progress.emit(pct)
+                frac = min(elapsed / expected_transcribe * 0.90, 0.90)
+                emit(frac)
 
         self._current_proc.wait()
         rc = self._current_proc.returncode
         self._current_proc = None
         if rc != 0 and not self._should_stop:
-            raise RuntimeError(f"subplz exited with status {rc}")
+            raise RuntimeError(f"subplz {kind} exited with status {rc}")
 
 
 class MainWindow(QWidget):
@@ -382,18 +428,25 @@ class MainWindow(QWidget):
         self._last_output_dirs: list[Path] = []
 
         # Action selector (what to do with the audio+text pair)
-        self.action_sync = QRadioButton("Sync subtitles (audio + epub/txt → SRT)")
+        self.action_sync = QRadioButton("Sync subtitles (audio + epub → SRT)")
         self.action_srs = QRadioButton("Build Anki deck (audio + SRT → .apkg)")
+        self.action_both = QRadioButton("Sync + Build deck (audio + epub → SRT + .apkg)")
         self.action_sync.setChecked(True)
         action_group = QButtonGroup(self)
         action_group.addButton(self.action_sync)
         action_group.addButton(self.action_srs)
-        self.action_sync.toggled.connect(self._on_action_changed)
+        action_group.addButton(self.action_both)
+        # Either toggled() fires twice on radio change (one off, one on); guard
+        # against duplicate work by connecting only the becoming-true edge.
+        self.action_sync.toggled.connect(lambda c: c and self._on_action_changed())
+        self.action_srs.toggled.connect(lambda c: c and self._on_action_changed())
+        self.action_both.toggled.connect(lambda c: c and self._on_action_changed())
 
         action_box = QGroupBox("Action")
         ab = QHBoxLayout()
         ab.addWidget(self.action_sync)
         ab.addWidget(self.action_srs)
+        ab.addWidget(self.action_both)
         ab.addStretch()
         action_box.setLayout(ab)
 
@@ -664,13 +717,16 @@ class MainWindow(QWidget):
         self.folder_box.setVisible(not is_single)
 
     def _on_action_changed(self):
-        is_srs = self.action_srs.isChecked()
-        self.settings_sync.setVisible(not is_srs)
-        self.settings_srs.setVisible(is_srs)
+        is_srs_only = self.action_srs.isChecked()
+        is_both = self.action_both.isChecked()
+        # Sync settings visible whenever sync runs (sync-only or both)
+        self.settings_sync.setVisible(not is_srs_only)
+        # SRS settings visible whenever srs runs (srs-only or both)
+        self.settings_srs.setVisible(is_srs_only or is_both)
         # Folder detection rules change with action; refresh preview.
         self._refresh_folder_preview()
         # Hint placeholder text on the text field
-        if is_srs:
+        if is_srs_only:
             self.text_edit.setPlaceholderText("Path to SRT/VTT/ASS file (the subtitle source)")
         else:
             self.text_edit.setPlaceholderText("Path to epub/txt file")
@@ -717,6 +773,8 @@ class MainWindow(QWidget):
         if not folder:
             self.folder_preview.setText("")
             return
+        # Only the srs-only path expects pre-existing SRTs. Sync and Sync+Build
+        # both consume epub/txt as the "text" input.
         exts = SRS_TEXT_EXTS if self.action_srs.isChecked() else TEXT_EXTS
         try:
             pairs = detect_pairs(Path(folder), exts)
@@ -744,14 +802,19 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Nothing to do", "No audiobook/text pairs were found.")
             return
 
-        action = "srs" if self.action_srs.isChecked() else "sync"
+        if self.action_srs.isChecked():
+            action = "srs"
+        elif self.action_both.isChecked():
+            action = "both"
+        else:
+            action = "sync"
         opts = {
             "action": action,
             "model": self.model_combo.currentText(),
             "lang": self.lang_edit.text().strip() or "ja",
             "mlx": self.mlx_check.isChecked(),
         }
-        if action == "srs":
+        if action in ("srs", "both"):
             # Validate pad/fade are integers and non-negative; fall back to defaults
             # if the user typed something weird.
             try:
@@ -777,10 +840,9 @@ class MainWindow(QWidget):
         self.batch_bar.setValue(0)
         self.status_label.setText(f"Starting — {len(jobs)} book(s) queued…")
 
-        # Record output folders for the "Open folder" button. For sync's -d
-        # mode it's the workdir; for explicit --audio mode (and srs) it's the
-        # audio's parent — unless srs has an explicit output dir set.
-        srs_out = opts.get("srs_output_dir") if action == "srs" else None
+        # Record output folders for the "Open folder" button. SRS-explicit dir
+        # wins (for srs and both); else sync's -d workdir; else audio's parent.
+        srs_out = opts.get("srs_output_dir") if action in ("srs", "both") else None
         if srs_out:
             self._last_output_dirs = [Path(srs_out)] * len(jobs)
         else:
@@ -832,6 +894,7 @@ class MainWindow(QWidget):
             folder = self.folder_edit.text().strip()
             if not folder or not Path(folder).exists():
                 return []
+            # Sync and Sync+Build both pair on epub/txt; srs-only pairs on SRT.
             exts = SRS_TEXT_EXTS if self.action_srs.isChecked() else TEXT_EXTS
             return detect_pairs(Path(folder), exts)
 
@@ -873,8 +936,9 @@ class MainWindow(QWidget):
         """
         if not self._last_output_dirs:
             return
-        # Reveal an .apkg if we just built one; otherwise an .srt; else the dir.
-        revealed_glob = "*.apkg" if self.action_srs.isChecked() else "*.srt"
+        # Reveal an .apkg if we built one; otherwise an .srt; else the dir.
+        built_apkg = self.action_srs.isChecked() or self.action_both.isChecked()
+        revealed_glob = "*.apkg" if built_apkg else "*.srt"
         opened: set[str] = set()
         for d in self._last_output_dirs:
             if not d.exists():
