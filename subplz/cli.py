@@ -1001,6 +1001,68 @@ def setup_commands_cli(parser):
         advanced_group_scanner,
     )
 
+    # tts command — epub → audiobook + SRT
+    tts = sp.add_parser(
+        "tts",
+        help="Synthesize an audiobook (WAV + SRT) from an epub using SBV2 or Irodori",
+        usage="subplz tts --epub PATH --backend [sbv2|irodori] --voice NAME --output-dir DIR",
+    )
+    tts.add_argument("--epub", default=None,
+                     help="Path to the epub source. Optional if --sentences-file is given.")
+    tts.add_argument("--sentences-file", default=None,
+                     help="Newline-separated pre-extracted sentences (skip epub parsing). "
+                          "Use this to reuse a parsed book across multiple voice runs.")
+    tts.add_argument("--output-stem", default=None,
+                     help="Override the output filename stem (default: epub stem).")
+    tts.add_argument("--backend", required=True, choices=["sbv2", "irodori"],
+                     help="TTS backend: sbv2 (fast, pretrained voices) or irodori (slower, voice-clone)")
+    tts.add_argument("--voice", required=True, help="Registered voice name (see `subplz voice list`)")
+    tts.add_argument("--output-dir", required=True, help="Where to write the WAV + SRT")
+    tts.add_argument("--device", default=None, choices=["cpu", "mps", "cuda"],
+                     help="Inference device (default: cpu for SBV2; mps for Irodori on Mac)")
+    tts.add_argument("--max-sentences", type=int, default=None,
+                     help="Only synthesize the first N sentences (for quick tests)")
+    tts.add_argument("--max-chars", type=int, default=None,
+                     help="Only synthesize the first ~N characters of the book (whole-sentence boundary)")
+    # Irodori-only quality knobs (silently ignored by SBV2)
+    tts.add_argument("--num-steps", type=int, default=None,
+                     help="[Irodori] RF-diffusion sampling steps. 24=fast, 40=default, 60=highest quality. More steps = richer prosody + less granularity.")
+    tts.add_argument("--cfg-scale-speaker", type=float, default=None,
+                     help="[Irodori] Speaker conditioning strength. Default 5.0; lower (3.5-4.0) loosens voice lock-in for more emotional freedom.")
+    tts.add_argument("--caption", type=str, default=None,
+                     help="[Irodori] Optional style hint, e.g. '感情豊かな朗読' or 'calm narration'. Honored only on caption-enabled checkpoints.")
+    tts.add_argument("--mp3-bitrate", type=str, default=None,
+                     help="MP3 bitrate (default: 64k mono — audiobook standard). Try 96k for music, 32k for max compression.")
+
+    # voice command — list / clone / install-preset
+    voice = sp.add_parser("voice", help="Manage TTS voices")
+    voice_sub = voice.add_subparsers(dest="voice_op", required=True)
+
+    v_list = voice_sub.add_parser("list", help="List installed voices")
+    v_list.add_argument("--backend", choices=["sbv2", "irodori"], default=None,
+                        help="Filter by backend")
+
+    v_clone = voice_sub.add_parser("clone",
+                                   help="Auto-trim a reference clip from any audio and register an Irodori voice")
+    v_clone.add_argument("--audio", required=True, help="Source audio file (any format ffmpeg can read)")
+    v_clone.add_argument("--name", required=True, help="Name to register the voice as")
+    v_clone.add_argument("--start", type=float, default=60.0,
+                         help="Seconds to skip before extracting (default 60 — skips most intros)")
+    v_clone.add_argument("--duration", type=float, default=15.0,
+                         help="Reference clip length in seconds (default 15)")
+    v_clone.add_argument("--overwrite", action="store_true",
+                         help="Replace an existing voice with the same name")
+
+    v_install = voice_sub.add_parser("install-preset",
+                                     help="Download a known SBV2 voice preset")
+    # Choices intentionally not constrained here — the catalog lives in
+    # subplz/tts.py (SBV2_PRESETS) and we don't want to import torch/numpy
+    # at parse time just to populate `choices`. install_sbv2_preset() raises
+    # a clear error on unknown names and prints the full list.
+    v_install.add_argument("--name", required=True,
+                           help="Preset key (run `subplz voice install-preset --name X` on an "
+                                "unknown name to get the full list of available presets)")
+
     return parser
 
     return parser

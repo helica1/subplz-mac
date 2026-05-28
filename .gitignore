@@ -22,3 +22,8 @@ smoketest_15min/
 epub-audiobook/
 .DS_Store
 .claude/
+
+# TTS: spike workspace (Irodori clone + isolated venv + downloaded model
+# checkpoints — gigabytes) and per-run outputs.
+tts_spike/
+tts_out/

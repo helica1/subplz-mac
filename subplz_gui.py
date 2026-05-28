@@ -19,29 +19,39 @@ from __future__ import annotations
 import os
 import re
 import select
+import json
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -50,6 +60,9 @@ from PySide6.QtWidgets import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SUBPLZ_BIN = PROJECT_ROOT / ".venv" / "bin" / "subplz"
+# In-flight TTS run registry. Single-job: written on Generate, cleared on
+# success. On launch, MainWindow checks for it and offers to resume.
+ACTIVE_JOB_PATH = Path.home() / ".subplz" / "active_job.json"
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".mp4", ".aac", ".flac", ".ogg", ".wav", ".opus", ".mkv", ".webm"}
 TEXT_EXTS = {".epub", ".txt", ".srt", ".vtt", ".ass"}
@@ -409,12 +422,15 @@ class SyncWorker(QObject):
             raise RuntimeError(f"subplz {kind} exited with status {rc}")
 
 
-class MainWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("SubPlz")
-        self.resize(720, 580)
-        # Accept drag-and-drop anywhere on the window. We classify what was
+class SyncTab(QWidget):
+    """The original SubPlz UI — audio+text→SRT and Anki deck building.
+
+    Wrapped as a tab inside MainWindow alongside the TTS tab. Drag-and-drop
+    works on this widget directly when it's the active tab."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Accept drag-and-drop anywhere on this tab. We classify what was
         # dropped (folder / audio / text / mixed) and route to the right
         # mode + field, so the user doesn't have to think about which slot
         # to drop on.
@@ -970,6 +986,1032 @@ class MainWindow(QWidget):
             self.worker = None
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+
+
+# ============================================================ TTS tab and helpers
+
+# Mirror of subplz.tts.SBV2_PRESETS for the install dialog. Kept duplicated
+# (instead of importing) so the GUI launches without pulling torch/numpy at
+# startup time — the actual install runs as a subprocess to `subplz voice`.
+SBV2_PRESET_INFO = [
+    # (key, tag, blurb shown in the install dialog)
+    ("rikka_botan_cool",  "narrator",  "Female, soft/unhurried (おっとり); markets for 朗読 — CC-BY-SA"),
+    ("koharune-ami",      "narrator",  "Female (young adult), corpus, 6 styles — amitaro.net terms"),
+    ("amitaro",           "narrator",  "Same VA as koharune-ami, livestream-trained — amitaro.net terms"),
+    ("lux",               "character", "Original female character (v2.6.1) — CC-BY-4.0"),
+    ("rikka_botan_sweet", "character", "Female, sweet/cute register — license unknown"),
+    ("fumifumi",          "character", "Female single voice (v2.2-JP-Extra) — license unknown"),
+    ("jvnv-f1-jp",        "emotional", "Female, 7 emotion styles (anger/sad/happy/etc.) — CC-BY-SA"),
+    ("jvnv-f2-jp",        "emotional", "Second female, 7 emotion styles — CC-BY-SA"),
+    ("jvnv-m1-jp",        "emotional", "Adult male, 7 emotion styles — CC-BY-SA"),
+    ("jvnv-m2-jp",        "emotional", "Second adult male, 7 emotion styles — CC-BY-SA"),
+    ("mofa-girls",        "emotional", "Pack: 4 young females + 1 male, 26 styles each — MIT"),
+]
+
+
+def _list_voices(backend: str) -> list[str]:
+    """Read voice names from disk directly (cheap, no subprocess)."""
+    root = Path(os.environ.get("SUBPLZ_VOICES_DIR") or (Path.home() / ".subplz" / "voices"))
+    bdir = root / backend
+    if not bdir.exists():
+        return []
+    return sorted(p.name for p in bdir.iterdir() if p.is_dir())
+
+
+def _run_voice_cmd(args: list[str], log_emit) -> bool:
+    """Run `subplz voice …`, stream stdout/stderr to log_emit. Returns success."""
+    cmd = [str(SUBPLZ_BIN), "voice", *args]
+    log_emit(f"$ {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        log_emit(line.rstrip())
+    return proc.wait() == 0
+
+
+class InstallPresetDialog(QDialog):
+    """Multi-select dialog to install SBV2 narrator presets."""
+
+    def __init__(self, parent=None, already_installed: Optional[set[str]] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Install SBV2 voice presets")
+        self.resize(560, 420)
+        already = already_installed or set()
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Select presets to download (~250 MB each):"))
+        self.listw = QListWidget()
+        for key, tag, blurb in SBV2_PRESET_INFO:
+            item = QListWidgetItem(f"[{tag:9s}] {key} — {blurb}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            if key in already:
+                item.setCheckState(Qt.Checked)
+                item.setText(item.text() + "   (installed)")
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsEnabled)
+            else:
+                item.setCheckState(Qt.Unchecked)
+            item.setData(Qt.UserRole, key)
+            self.listw.addItem(item)
+        layout.addWidget(self.listw, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        self.setLayout(layout)
+
+    def selected(self) -> list[str]:
+        out = []
+        for i in range(self.listw.count()):
+            item = self.listw.item(i)
+            if (item.flags() & Qt.ItemIsUserCheckable) and item.checkState() == Qt.Checked:
+                out.append(item.data(Qt.UserRole))
+        return out
+
+
+class CloneVoiceDialog(QDialog):
+    """Pick an audio file, set start/duration, register as Irodori voice."""
+
+    DEFAULT_DURATION = 20  # Irodori caps reference at 30s; 20 leaves headroom.
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Clone Irodori voice from audio")
+        self.resize(540, 200)
+
+        self.audio_edit = QLineEdit()
+        self.audio_edit.setPlaceholderText("Pick an audiobook / podcast / clean voice recording")
+        self.audio_edit.textChanged.connect(self._sync_default_name)
+        audio_btn = QPushButton("Browse…")
+        audio_btn.clicked.connect(self._pick_audio)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("voice name (defaults from filename)")
+
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, 60 * 60)
+        self.start_spin.setValue(60)
+        self.start_spin.setSuffix(" s")
+        self.dur_spin = QSpinBox()
+        self.dur_spin.setRange(5, 30)
+        self.dur_spin.setValue(self.DEFAULT_DURATION)
+        self.dur_spin.setSuffix(" s")
+
+        form = QFormLayout()
+        row = QHBoxLayout()
+        row.addWidget(self.audio_edit, 1)
+        row.addWidget(audio_btn)
+        form.addRow("Audio source:", self._wrap(row))
+        form.addRow("Voice name:", self.name_edit)
+        form.addRow("Skip first:", self.start_spin)
+        form.addRow("Reference length:", self.dur_spin)
+        form.addRow(QLabel("Irodori caps reference at 30 s. 20 s is a safe default."))
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(btns)
+        self.setLayout(layout)
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        return w
+
+    def _pick_audio(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick reference audio", "",
+            "Audio (*.mp3 *.m4a *.m4b *.mp4 *.aac *.flac *.ogg *.wav *.opus);;All files (*)",
+        )
+        if p:
+            self.audio_edit.setText(p)
+
+    def _sync_default_name(self, txt: str):
+        if not self.name_edit.text().strip() and txt:
+            stem = Path(txt).stem
+            # Strip extension-like decorations: ".part1", " -cbr", etc.
+            stem = re.sub(r"[\s_-]+cbr$", "", stem, flags=re.I)
+            self.name_edit.setText(stem)
+
+    def _validate_and_accept(self):
+        if not self.audio_edit.text().strip():
+            QMessageBox.warning(self, "Missing audio", "Pick an audio file first.")
+            return
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Missing name", "Give the voice a name.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {
+            "audio": self.audio_edit.text().strip(),
+            "name":  self.name_edit.text().strip(),
+            "start": int(self.start_spin.value()),
+            "duration": int(self.dur_spin.value()),
+        }
+
+
+class TTSWorker(QObject):
+    """Runs `subplz tts …` in a thread, streams progress."""
+
+    log = Signal(str)
+    status = Signal(str)
+    sentence_progress = Signal(int, int)  # done, total
+    done = Signal(bool, str)  # success, message
+
+    def __init__(
+        self,
+        epub: Path,
+        backend: str,
+        voice: str,
+        out_dir: Path,
+        max_chars: int,
+        *,
+        sentences_file: Optional[Path] = None,
+        output_stem: Optional[str] = None,
+        num_steps: Optional[int] = None,
+        cfg_scale_speaker: Optional[float] = None,
+        caption: Optional[str] = None,
+        max_retries: int = 3,
+    ):
+        super().__init__()
+        self.epub = epub
+        self.backend = backend
+        self.voice = voice
+        self.out_dir = out_dir
+        self.max_chars = max_chars
+        self.sentences_file = sentences_file
+        self.output_stem = output_stem
+        self.num_steps = num_steps
+        self.cfg_scale_speaker = cfg_scale_speaker
+        self.caption = caption
+        self.max_retries = max_retries
+        self._cancel = False
+        self._proc: Optional[subprocess.Popen] = None
+
+    def stop(self):
+        self._cancel = True
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+
+    def run(self):
+        cmd = [
+            str(SUBPLZ_BIN), "tts",
+            "--backend", self.backend,
+            "--voice", self.voice,
+            "--output-dir", str(self.out_dir),
+        ]
+        # Prefer cached sentences (skips re-parsing the epub in the subprocess).
+        if self.sentences_file is not None:
+            cmd += ["--sentences-file", str(self.sentences_file)]
+            if self.output_stem:
+                cmd += ["--output-stem", self.output_stem]
+        else:
+            cmd += ["--epub", str(self.epub)]
+        if self.max_chars > 0:
+            cmd += ["--max-chars", str(self.max_chars)]
+        # Irodori-only knobs; the CLI silently ignores them for SBV2.
+        if self.backend == "irodori":
+            if self.num_steps is not None:
+                cmd += ["--num-steps", str(self.num_steps)]
+            if self.cfg_scale_speaker is not None:
+                cmd += ["--cfg-scale-speaker", str(self.cfg_scale_speaker)]
+            if self.caption:
+                cmd += ["--caption", self.caption]
+
+        # Auto-retry loop. Each retry re-spawns the same subprocess; the
+        # pipeline's per-sentence resume logic in subplz/tts.py picks up
+        # where the previous attempt left off, so retries are cheap.
+        tqdm_re = re.compile(r"\b(\d+)/(\d+)\b")
+        last_rc: Optional[int] = None
+        for attempt in range(1, self.max_retries + 1):
+            if self._cancel:
+                break
+            if attempt == 1:
+                self.status.emit(f"Running {self.backend} on {self.voice}…")
+            else:
+                self.status.emit(f"Auto-retry {attempt}/{self.max_retries}…")
+                self.log.emit(f"⟳ Auto-retry {attempt}/{self.max_retries} (previous exit {last_rc})")
+            self.log.emit(f"$ {' '.join(cmd)}")
+            try:
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                for line in self._proc.stdout:
+                    if self._cancel:
+                        break
+                    self.log.emit(line.rstrip())
+                    m = tqdm_re.search(line)
+                    if m:
+                        done = int(m.group(1)); total = int(m.group(2))
+                        if total > 0 and done <= total:
+                            self.sentence_progress.emit(done, total)
+                last_rc = self._proc.wait()
+            except Exception as e:
+                self.done.emit(False, f"{type(e).__name__}: {e}")
+                return
+            if self._cancel:
+                self.done.emit(False, "Cancelled.")
+                return
+            if last_rc == 0:
+                self.done.emit(True, f"Wrote audiobook to {self.out_dir}")
+                return
+            # Non-zero exit: retry unless we've exhausted attempts.
+            if attempt < self.max_retries:
+                time.sleep(2)  # brief backoff before re-spawning
+        self.done.emit(False, f"subplz tts failed after {self.max_retries} attempts (last exit {last_rc})")
+
+
+class _VoiceActionWorker(QObject):
+    """One-shot worker for `subplz voice install-preset` / `voice clone`."""
+
+    log = Signal(str)
+    done = Signal(bool)
+
+    def __init__(self, args_batches: list[list[str]]):
+        super().__init__()
+        self.args_batches = args_batches
+
+    def run(self):
+        ok_all = True
+        for args in self.args_batches:
+            ok = _run_voice_cmd(args, self.log.emit)
+            if not ok:
+                ok_all = False
+        self.done.emit(ok_all)
+
+
+class TTSTab(QWidget):
+    """Generate an audiobook (WAV + SRT) from an epub using SBV2 or Irodori."""
+
+    # QSettings keys for persisted Irodori knobs
+    K_NUM_STEPS = "tts/irodori/num_steps"
+    K_CFG_SPK   = "tts/irodori/cfg_scale_speaker"
+    K_CAPTION   = "tts/irodori/caption"
+    K_MAX_CHARS = "tts/max_chars"
+    K_BACKEND   = "tts/backend"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.thread: Optional[QThread] = None
+        self.worker: Optional[object] = None
+        self._last_out_dir: Optional[Path] = None
+        # Settings: cross-platform store. On Mac this lives in ~/Library/Preferences/.
+        self.settings = QSettings("subplz", "gui")
+        # Sentence cache keyed by (epub_path, mtime). When user re-uses the
+        # same epub across multiple voice runs, we skip the parse entirely.
+        self._sentence_cache: dict[tuple[str, float], list[str]] = {}
+        self._sentence_temp: Optional[Path] = None
+        # Run stats — set in _on_run, read in _on_done
+        self._run_start: Optional[float] = None
+        self._run_audio_s: Optional[float] = None
+
+        # ----- backend chooser -----
+        self.bk_sbv2 = QRadioButton("SBV2  (fast, ~7× realtime)")
+        self.bk_irod = QRadioButton("Irodori  (slower, voice-clone from any audio)")
+        self.bk_sbv2.setChecked(True)
+        bk_grp = QButtonGroup(self)
+        bk_grp.addButton(self.bk_sbv2)
+        bk_grp.addButton(self.bk_irod)
+        self.bk_sbv2.toggled.connect(lambda c: c and self._on_backend_changed())
+        self.bk_irod.toggled.connect(lambda c: c and self._on_backend_changed())
+        bk_row = QHBoxLayout()
+        bk_row.addWidget(self.bk_sbv2)
+        bk_row.addWidget(self.bk_irod)
+        bk_row.addStretch()
+        bk_box = QGroupBox("Backend")
+        bk_box.setLayout(bk_row)
+
+        # ----- voice chooser -----
+        self.voice_combo = QComboBox()
+        self.voice_combo.setMinimumWidth(280)
+        self.manage_btn = QPushButton("Install preset…")
+        self.manage_btn.clicked.connect(self._on_manage_clicked)
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setToolTip("Reload installed voices")
+        refresh_btn.setMaximumWidth(32)
+        refresh_btn.clicked.connect(self._reload_voices)
+        v_row = QHBoxLayout()
+        v_row.addWidget(QLabel("Voice:"))
+        v_row.addWidget(self.voice_combo, 1)
+        v_row.addWidget(refresh_btn)
+        v_row.addWidget(self.manage_btn)
+        v_box = QGroupBox("Voice")
+        v_box.setLayout(v_row)
+
+        # ----- epub picker -----
+        self.epub_edit = QLineEdit()
+        self.epub_edit.setPlaceholderText("Drop an .epub here, or browse")
+        epub_btn = QPushButton("Browse…")
+        epub_btn.clicked.connect(self._pick_epub)
+        ep_row = QHBoxLayout()
+        ep_row.addWidget(QLabel("Epub:"))
+        ep_row.addWidget(self.epub_edit, 1)
+        ep_row.addWidget(epub_btn)
+
+        # Irodori-only: drop an audio file to quick-clone a voice for this run.
+        # Wraps the whole row in a QWidget so it can be hidden as a unit when
+        # SBV2 is the active backend.
+        self.ref_audio_edit = QLineEdit()
+        self.ref_audio_edit.setPlaceholderText(
+            "Optional: drop an audio file here to quick-clone a new Irodori voice (overrides Voice above)"
+        )
+        ref_btn = QPushButton("Browse…")
+        ref_btn.clicked.connect(self._pick_ref_audio)
+        ref_clear_btn = QPushButton("×")
+        ref_clear_btn.setToolTip("Clear — fall back to selected Voice")
+        ref_clear_btn.setMaximumWidth(28)
+        ref_clear_btn.clicked.connect(lambda: self.ref_audio_edit.clear())
+        ref_inner = QHBoxLayout()
+        ref_inner.setContentsMargins(0, 0, 0, 0)
+        ref_inner.addWidget(QLabel("Ref audio:"))
+        ref_inner.addWidget(self.ref_audio_edit, 1)
+        ref_inner.addWidget(ref_btn)
+        ref_inner.addWidget(ref_clear_btn)
+        self.ref_audio_row = QWidget()
+        self.ref_audio_row.setLayout(ref_inner)
+
+        self.out_edit = QLineEdit()
+        self.out_edit.setPlaceholderText("Output folder (default: same folder as the epub)")
+        out_btn = QPushButton("Browse…")
+        out_btn.clicked.connect(self._pick_out)
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output:"))
+        out_row.addWidget(self.out_edit, 1)
+        out_row.addWidget(out_btn)
+
+        ep_box = QGroupBox("Source")
+        epv = QVBoxLayout()
+        epv.addLayout(ep_row)
+        epv.addWidget(self.ref_audio_row)
+        epv.addLayout(out_row)
+        ep_box.setLayout(epv)
+
+        # ----- options -----
+        self.chars_spin = QSpinBox()
+        self.chars_spin.setRange(0, 5_000_000)
+        self.chars_spin.setSingleStep(500)
+        self.chars_spin.setValue(1500)
+        self.chars_spin.setSuffix(" chars")
+        self.chars_spin.setSpecialValueText("entire book")
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("How much to synthesize:"))
+        opt_row.addWidget(self.chars_spin)
+        opt_row.addWidget(QLabel("(JA chars; whole-sentence boundary, 0 = entire book)"))
+        opt_row.addStretch()
+        opt_box = QGroupBox("Options")
+        opt_box.setLayout(opt_row)
+
+        # ----- Irodori advanced (only visible when Irodori is selected) -----
+        # Wider spinboxes so the up/down arrows are real click targets;
+        # QFormLayout was crushing both the buttons and the wrapped help text.
+        self.irod_steps_spin = QSpinBox()
+        self.irod_steps_spin.setRange(8, 80)
+        self.irod_steps_spin.setSingleStep(2)
+        self.irod_steps_spin.setValue(40)
+        self.irod_steps_spin.setMinimumWidth(110)
+
+        self.irod_cfg_spk_spin = QDoubleSpinBox()
+        self.irod_cfg_spk_spin.setRange(1.0, 10.0)
+        self.irod_cfg_spk_spin.setSingleStep(0.5)
+        self.irod_cfg_spk_spin.setDecimals(1)
+        self.irod_cfg_spk_spin.setValue(5.0)
+        self.irod_cfg_spk_spin.setMinimumWidth(110)
+
+        self.irod_caption_edit = QLineEdit()
+        self.irod_caption_edit.setPlaceholderText("e.g. 落ち着いた朗読、内省的な語り口")
+
+        def _help(text: str, lines: int = 2) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #888; font-size: 11px;")
+            lbl.setWordWrap(True)
+            # Qt word-wrapped labels don't compute heightForWidth ahead of
+            # layout, so the row collapses to one line of text height. Reserve
+            # explicit height for the expected number of wrapped lines.
+            lbl.setMinimumHeight(16 * lines + 8)
+            lbl.setContentsMargins(0, 0, 0, 6)
+            return lbl
+
+        self.irod_steps_help = _help(
+            "More steps = richer prosody, less granularity in the voice. "
+            "Slower. 24=fast, 40=default, 60+=highest quality.",
+            lines=2,
+        )
+        self.irod_cfg_spk_help = _help(
+            "How strictly the voice locks to the cloned reference. Default 5.0. "
+            "Lower (3.5–4.0) gives the model more emotional freedom; too low and "
+            "the voice starts to drift off the reference.",
+            lines=3,
+        )
+        self.irod_caption_help = _help(
+            "Optional style hint (English or Japanese). Steers register/emotion. "
+            "Only honored on caption-enabled Irodori checkpoints — leave blank "
+            "if unsure (cleanest default behavior).",
+            lines=3,
+        )
+
+        def _row(label_text: str, widget: QWidget) -> QHBoxLayout:
+            h = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setMinimumWidth(220)
+            h.addWidget(lbl)
+            h.addWidget(widget)
+            h.addStretch()
+            return h
+
+        irod_layout = QVBoxLayout()
+        irod_layout.addLayout(_row("Sampling steps:", self.irod_steps_spin))
+        irod_layout.addWidget(self.irod_steps_help)
+        irod_layout.addLayout(_row("Speaker lock-in (cfg_scale_speaker):", self.irod_cfg_spk_spin))
+        irod_layout.addWidget(self.irod_cfg_spk_help)
+        irod_layout.addLayout(_row("Style caption:", self.irod_caption_edit))
+        irod_layout.addWidget(self.irod_caption_help)
+        self.irod_box = QGroupBox("Irodori — advanced")
+        self.irod_box.setLayout(irod_layout)
+
+        # ----- progress + buttons -----
+        self.status_label = QLabel("Pick a voice and an epub.")
+        self.status_label.setFont(QFont("", weight=QFont.DemiBold))
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("%v / %m sentences")
+        # Stats line, populated on completion
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet("color: #888; font-size: 11px;")
+
+        self.run_btn = QPushButton("▶  Generate audiobook")
+        self.run_btn.clicked.connect(self._on_run)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        self.open_btn = QPushButton("📂  Open output")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(self._on_open_output)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(self.open_btn)
+        btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.cancel_btn)
+
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Menlo, monospace", 11))
+        self.log_view.setMinimumHeight(160)
+
+        root = QVBoxLayout()
+        root.addWidget(bk_box)
+        root.addWidget(v_box)
+        root.addWidget(ep_box)
+        root.addWidget(opt_box)
+        root.addWidget(self.irod_box)
+        root.addWidget(self.status_label)
+        root.addWidget(self.progress)
+        root.addWidget(self.stats_label)
+        root.addLayout(btn_row)
+        root.addWidget(self.log_view, 1)
+        self.setLayout(root)
+
+        # Restore persisted settings BEFORE wiring change handlers so we
+        # don't trigger spurious saves during restoration.
+        self._restore_settings()
+        # Persist on every change. setattr loops keep this terse.
+        self.chars_spin.valueChanged.connect(
+            lambda v: self.settings.setValue(self.K_MAX_CHARS, int(v)))
+        self.irod_steps_spin.valueChanged.connect(
+            lambda v: self.settings.setValue(self.K_NUM_STEPS, int(v)))
+        self.irod_cfg_spk_spin.valueChanged.connect(
+            lambda v: self.settings.setValue(self.K_CFG_SPK, float(v)))
+        self.irod_caption_edit.textChanged.connect(
+            lambda t: self.settings.setValue(self.K_CAPTION, str(t)))
+        self.bk_sbv2.toggled.connect(
+            lambda c: c and self.settings.setValue(self.K_BACKEND, "sbv2"))
+        self.bk_irod.toggled.connect(
+            lambda c: c and self.settings.setValue(self.K_BACKEND, "irodori"))
+
+        self._on_backend_changed()  # populate voices for the default backend
+        # After the window has rendered, check for an unfinished run and
+        # offer to resume. QTimer.singleShot(0) defers until the event loop
+        # is idle so the dialog appears on top of a fully-drawn UI.
+        QTimer.singleShot(0, self._maybe_offer_session_resume)
+
+    # ----- session resume registry -----
+
+    def _save_active_job(self, params: dict) -> None:
+        try:
+            ACTIVE_JOB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ACTIVE_JOB_PATH.write_text(json.dumps(params, indent=2, ensure_ascii=False))
+        except OSError:
+            pass  # best-effort
+
+    def _clear_active_job(self) -> None:
+        try:
+            ACTIVE_JOB_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _maybe_offer_session_resume(self) -> None:
+        """If a previous run was interrupted (registry file exists), prompt
+        the user to resume. The actual resume just re-runs Generate with
+        the saved params — pipeline's per-sentence cache picks up where it
+        left off."""
+        if not ACTIVE_JOB_PATH.exists():
+            return
+        try:
+            p = json.loads(ACTIVE_JOB_PATH.read_text())
+        except Exception:
+            self._clear_active_job()
+            return
+        # Sanity-check the work_dir actually exists; otherwise the entry is
+        # stale (success cleanup ran but registry clear failed, or user
+        # deleted the output dir manually).
+        out_dir = Path(p.get("out_dir", ""))
+        epub_path = Path(p.get("epub", ""))
+        stem = f"{epub_path.stem}.{p.get('backend','')}.{p.get('voice','')}"
+        work_dir = out_dir / f".{stem}.subplz-work"
+        if not work_dir.exists():
+            self._clear_active_job()
+            return
+        n_done = sum(1 for f in work_dir.glob("[0-9]" * 6 + ".wav"))
+        n_total = 0
+        meta = work_dir / "meta.json"
+        if meta.exists():
+            try:
+                n_total = int(json.loads(meta.read_text()).get("n_sentences", 0))
+            except Exception:
+                pass
+        progress = f"{n_done}/{n_total}" if n_total else f"{n_done}"
+        msg = (f"Found an unfinished generation:\n\n"
+               f"  Book: {epub_path.name}\n"
+               f"  Backend: {p.get('backend')}\n"
+               f"  Voice: {p.get('voice')}\n"
+               f"  Progress: {progress} sentences\n\n"
+               f"Resume now? (No keeps it for later, Discard deletes the partial output.)")
+        ans = QMessageBox.question(
+            self, "Resume previous run?", msg,
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Discard,
+            QMessageBox.Yes,
+        )
+        if ans == QMessageBox.Yes:
+            self._switch_to_tts_tab()
+            self._populate_from_job(p)
+            QTimer.singleShot(150, self._on_run)
+        elif ans == QMessageBox.Discard:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self._clear_active_job()
+
+    def _switch_to_tts_tab(self) -> None:
+        """If we're sitting inside a MainWindow with tabs, raise the TTS tab.
+        Lookup is by ancestry rather than a hardcoded parent ref so the tab
+        still works if reparented elsewhere later."""
+        parent = self.parent()
+        while parent is not None and not isinstance(parent, QTabWidget):
+            parent = parent.parent()
+        if isinstance(parent, QTabWidget):
+            parent.setCurrentWidget(self)
+
+    def _populate_from_job(self, p: dict) -> None:
+        if p.get("backend") == "irodori":
+            self.bk_irod.setChecked(True)
+        else:
+            self.bk_sbv2.setChecked(True)
+        self._reload_voices()
+        self.epub_edit.setText(p.get("epub", ""))
+        self.out_edit.setText(p.get("out_dir", ""))
+        try:
+            self.chars_spin.setValue(int(p.get("max_chars", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        if "num_steps" in p:
+            try: self.irod_steps_spin.setValue(int(p["num_steps"]))
+            except (TypeError, ValueError): pass
+        if "cfg_scale_speaker" in p:
+            try: self.irod_cfg_spk_spin.setValue(float(p["cfg_scale_speaker"]))
+            except (TypeError, ValueError): pass
+        if "caption" in p:
+            self.irod_caption_edit.setText(str(p["caption"] or ""))
+        idx = self.voice_combo.findText(p.get("voice", ""))
+        if idx >= 0:
+            self.voice_combo.setCurrentIndex(idx)
+
+    def _restore_settings(self):
+        s = self.settings
+        # Backend: setChecked() before voice reload so the right list loads
+        if s.value(self.K_BACKEND, "sbv2") == "irodori":
+            self.bk_irod.setChecked(True)
+        else:
+            self.bk_sbv2.setChecked(True)
+        try:
+            self.chars_spin.setValue(int(s.value(self.K_MAX_CHARS, 1500)))
+            self.irod_steps_spin.setValue(int(s.value(self.K_NUM_STEPS, 40)))
+            self.irod_cfg_spk_spin.setValue(float(s.value(self.K_CFG_SPK, 5.0)))
+            self.irod_caption_edit.setText(str(s.value(self.K_CAPTION, "") or ""))
+        except (TypeError, ValueError):
+            # If the stored value is garbage, fall back silently to defaults.
+            pass
+
+    # ---- drag and drop ----
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() and any(u.isLocalFile() for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        for p in paths:
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext == ".epub":
+                self.epub_edit.setText(str(p))
+                event.acceptProposedAction()
+                return
+            if ext in AUDIO_EXTS and self._current_backend() == "irodori":
+                self.ref_audio_edit.setText(str(p))
+                self._quick_clone_from_ref(p)
+                event.acceptProposedAction()
+                return
+
+    # ---- helpers ----
+    def _current_backend(self) -> str:
+        return "sbv2" if self.bk_sbv2.isChecked() else "irodori"
+
+    def _reload_voices(self):
+        backend = self._current_backend()
+        voices = _list_voices(backend)
+        self.voice_combo.clear()
+        if voices:
+            self.voice_combo.addItems(voices)
+            self.voice_combo.setEnabled(True)
+        else:
+            placeholder = ("No SBV2 voices installed. Click 'Install preset…' to download some."
+                           if backend == "sbv2"
+                           else "No Irodori voices yet. Click 'Clone from audio…' to add one.")
+            self.voice_combo.addItem(placeholder)
+            self.voice_combo.setEnabled(False)
+
+    def _on_backend_changed(self):
+        backend = self._current_backend()
+        if backend == "sbv2":
+            self.manage_btn.setText("Install preset…")
+        else:
+            self.manage_btn.setText("Clone from audio…")
+        # Irodori-only widgets hide when SBV2 is active
+        if hasattr(self, "irod_box"):
+            self.irod_box.setVisible(backend == "irodori")
+        if hasattr(self, "ref_audio_row"):
+            self.ref_audio_row.setVisible(backend == "irodori")
+        self._reload_voices()
+
+    def _on_manage_clicked(self):
+        if self._current_backend() == "sbv2":
+            installed = set(_list_voices("sbv2"))
+            dlg = InstallPresetDialog(self, already_installed=installed)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            picked = dlg.selected()
+            if not picked:
+                return
+            args_batches = [["install-preset", "--name", p] for p in picked]
+        else:
+            dlg = CloneVoiceDialog(self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            v = dlg.values()
+            args_batches = [[
+                "clone", "--audio", v["audio"], "--name", v["name"],
+                "--start", str(v["start"]), "--duration", str(v["duration"]),
+                "--overwrite",
+            ]]
+
+        self._append_log(f"Voice op started ({len(args_batches)} job(s))…")
+        self.run_btn.setEnabled(False)
+        self.manage_btn.setEnabled(False)
+        self.thread = QThread()
+        self.worker = _VoiceActionWorker(args_batches)
+        self.worker.moveToThread(self.thread)
+        self.worker.log.connect(self._append_log)
+        self.worker.done.connect(self._on_voice_op_done)
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+
+    def _on_voice_op_done(self, ok: bool):
+        self._teardown_thread()
+        self.run_btn.setEnabled(True)
+        self.manage_btn.setEnabled(True)
+        self._reload_voices()
+        if ok:
+            self._append_log("✅  Voice op complete.")
+        else:
+            self._append_log("❌  Voice op failed (see log above).")
+
+    def _pick_epub(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Pick epub", "", "Epub (*.epub);;All files (*)")
+        if p:
+            self.epub_edit.setText(p)
+
+    def _pick_ref_audio(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick reference audio", "",
+            "Audio (*.mp3 *.m4a *.m4b *.mp4 *.aac *.flac *.ogg *.wav *.opus);;All files (*)",
+        )
+        if p:
+            self.ref_audio_edit.setText(p)
+            self._quick_clone_from_ref(Path(p))
+
+    def _quick_clone_from_ref(self, audio_path: Path):
+        """Synchronously clone (overwrites) and auto-select in the voice combo.
+        ffmpeg trim is ~1s so blocking the UI thread is fine; longer than that
+        and we'd push this to _VoiceActionWorker."""
+        voice = self._voice_name_from_audio(audio_path)
+        self.status_label.setText(f"Cloning '{voice}'…")
+        self._append_log(f"Quick-cloning '{voice}' from {audio_path.name}…")
+        ok = _run_voice_cmd(
+            ["clone", "--audio", str(audio_path), "--name", voice,
+             "--start", "60", "--duration", "20", "--overwrite"],
+            self._append_log,
+        )
+        if not ok:
+            self.status_label.setText("❌  Clone failed (see log)")
+            return
+        self._reload_voices()
+        idx = self.voice_combo.findText(voice)
+        if idx >= 0:
+            self.voice_combo.setCurrentIndex(idx)
+        self.status_label.setText(f"✅  Voice '{voice}' ready — click Generate")
+
+    def _pick_out(self):
+        p = QFileDialog.getExistingDirectory(self, "Pick output folder")
+        if p:
+            self.out_edit.setText(p)
+
+    @staticmethod
+    def _voice_name_from_audio(audio_path: Path) -> str:
+        """Derive a sane voice-library name from an audio filename.
+        Strips common decorations like ' -cbr', surrounding brackets, and
+        whitespace. Falls back to the bare stem if the cleanup empties it."""
+        stem = audio_path.stem
+        # Strip "(... )", "[...]", and " -cbr" / "_cbr" tails
+        stem = re.sub(r"\s*[\[\(][^\]\)]*[\]\)]", "", stem)
+        stem = re.sub(r"[\s_-]+cbr$", "", stem, flags=re.I)
+        stem = stem.strip()
+        return stem or audio_path.stem
+
+    def _on_run(self):
+        if not SUBPLZ_BIN.exists():
+            QMessageBox.critical(
+                self, "subplz not found",
+                f"Expected the subplz CLI at:\n  {SUBPLZ_BIN}\n\n"
+                f"Run `.venv/bin/pip install -e .` from the project root first.",
+            )
+            return
+        epub = self.epub_edit.text().strip()
+        if not epub or not Path(epub).exists():
+            QMessageBox.warning(self, "Missing epub", "Pick an .epub source.")
+            return
+
+        backend = self._current_backend()
+        # Fallback path: if Irodori, the field has a path, but the derived
+        # voice isn't in the library yet (paste/edit case — drop and Browse
+        # already cloned on-the-spot). Clone now before generating.
+        if backend == "irodori":
+            ref_audio = self.ref_audio_edit.text().strip()
+            if ref_audio:
+                ref_path = Path(ref_audio)
+                if not ref_path.exists():
+                    QMessageBox.warning(self, "Missing audio", f"Reference audio not found:\n{ref_path}")
+                    return
+                expected = self._voice_name_from_audio(ref_path)
+                if self.voice_combo.findText(expected) < 0:
+                    self._quick_clone_from_ref(ref_path)
+        if not self.voice_combo.isEnabled() or self.voice_combo.count() == 0:
+            QMessageBox.warning(self, "No voice", "Install or clone a voice first.")
+            return
+        voice = self.voice_combo.currentText()
+
+        out = self.out_edit.text().strip()
+        out_dir = Path(out) if out else Path(epub).parent
+        max_chars = int(self.chars_spin.value())  # 0 = entire book
+
+        # Sentence cache: parse the epub once per (path, mtime), reuse across
+        # runs. Lets the user A/B different voices on the same book without
+        # re-parsing each time.
+        epub_path = Path(epub)
+        try:
+            cache_key = (str(epub_path.resolve()), epub_path.stat().st_mtime)
+        except OSError:
+            cache_key = (str(epub_path), 0.0)
+        sentences = self._sentence_cache.get(cache_key)
+        if sentences is None:
+            self.status_label.setText("Parsing epub…")
+            QApplication.processEvents()
+            from subplz.tts import extract_sentences
+            try:
+                sentences = extract_sentences(epub_path, lang="ja")
+            except Exception as e:
+                QMessageBox.critical(self, "Parse failed", f"{type(e).__name__}: {e}")
+                self.status_label.setText("❌ Parse failed.")
+                return
+            self._sentence_cache[cache_key] = sentences
+            self._append_log(f"Parsed {len(sentences)} sentences from {epub_path.name} (cached)")
+        else:
+            self._append_log(f"Reusing {len(sentences)} cached sentences from {epub_path.name}")
+        # Write sentences to a temp file the subprocess will read.
+        if self._sentence_temp is None:
+            self._sentence_temp = Path(tempfile.mkstemp(prefix="subplz-sents-", suffix=".txt")[1])
+        self._sentence_temp.write_text("\n".join(sentences), encoding="utf-8")
+
+        self.log_view.clear()
+        self.progress.setValue(0)
+        self.progress.setRange(0, 0)  # busy bar until we know sentence count
+        self.run_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.open_btn.setEnabled(False)
+        self.stats_label.setText("")
+        self._last_out_dir = out_dir
+        self._run_start = time.monotonic()
+        self._run_audio_s = None
+
+        # Record this run in the registry so we can auto-offer resume next
+        # launch if the run crashes / the user closes the app mid-run.
+        self._save_active_job({
+            "epub": str(epub_path),
+            "backend": backend,
+            "voice": voice,
+            "out_dir": str(out_dir),
+            "max_chars": max_chars,
+            "num_steps": int(self.irod_steps_spin.value()),
+            "cfg_scale_speaker": float(self.irod_cfg_spk_spin.value()),
+            "caption": self.irod_caption_edit.text().strip() or "",
+        })
+
+        # Irodori-only knobs are passed regardless of backend; the worker
+        # only emits them on the CLI when backend == "irodori".
+        self.thread = QThread()
+        self.worker = TTSWorker(
+            epub_path, backend, voice, out_dir, max_chars,
+            sentences_file=self._sentence_temp,
+            output_stem=epub_path.stem,
+            num_steps=int(self.irod_steps_spin.value()),
+            cfg_scale_speaker=float(self.irod_cfg_spk_spin.value()),
+            caption=self.irod_caption_edit.text().strip() or None,
+        )
+        self.worker.moveToThread(self.thread)
+        self.worker.log.connect(self._append_log)
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.sentence_progress.connect(self._on_sentence_progress)
+        self.worker.done.connect(self._on_done)
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+
+    # Matches our CLI's final log line:  "Wrote ... (X.X min audio, RTF Y.YYx)"
+    _AUDIO_LEN_RE = re.compile(r"\((\d+(?:\.\d+)?)\s*min\s+audio", re.I)
+
+    def _on_sentence_progress(self, done: int, total: int):
+        if self.progress.maximum() != total:
+            self.progress.setRange(0, total)
+        self.progress.setValue(done)
+
+    def _on_cancel(self):
+        if self.worker:
+            self.worker.stop()
+            self.status_label.setText("Cancelling…")
+
+    def _on_done(self, ok: bool, msg: str):
+        self._teardown_thread()
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        if ok and self._last_out_dir and self._last_out_dir.exists():
+            self.open_btn.setEnabled(True)
+        # Clear the resume registry on success. On failure we keep it so the
+        # next launch can offer to pick up where we left off (or so the user
+        # can just hit Generate again — the pipeline already supports both).
+        if ok:
+            self._clear_active_job()
+        marker = "✅" if ok else "❌"
+        self.status_label.setText(f"{marker} {msg}")
+        self._append_log(f"{marker} {msg}")
+        if ok and self._run_start is not None:
+            wall_s = time.monotonic() - self._run_start
+            self.stats_label.setText(self._fmt_stats(wall_s, self._run_audio_s))
+        self._run_start = None
+        self._run_audio_s = None
+
+    @staticmethod
+    def _fmt_dur(sec: float) -> str:
+        s = int(round(sec))
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        if h: return f"{h}h {m:02d}m {s:02d}s"
+        if m: return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def _fmt_stats(self, wall_s: float, audio_s: Optional[float]) -> str:
+        if not audio_s or wall_s <= 0:
+            return f"Wall time: {self._fmt_dur(wall_s)}"
+        rtf = audio_s / wall_s
+        return (f"Wall time: {self._fmt_dur(wall_s)}  ·  "
+                f"Audio: {self._fmt_dur(audio_s)}  ·  "
+                f"RTF: {rtf:.2f}× realtime")
+
+    def _on_open_output(self):
+        if self._last_out_dir and self._last_out_dir.exists():
+            subprocess.run(["open", str(self._last_out_dir)], check=False)
+
+    def _append_log(self, line: str):
+        # Snoop the audio-length number out of the CLI's final summary line so
+        # we can show wall-vs-audio stats on completion. Cheap; ignored on miss.
+        m = self._AUDIO_LEN_RE.search(line)
+        if m:
+            try:
+                self._run_audio_s = float(m.group(1)) * 60.0
+            except ValueError:
+                pass
+        if self.log_view.document().blockCount() > 2000:
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            for _ in range(500):
+                cursor.select(cursor.SelectionType.LineUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()
+        self.log_view.append(line)
+
+    def _teardown_thread(self):
+        if self.thread:
+            self.thread.quit()
+            self.thread.wait(2000)
+            self.thread = None
+            self.worker = None
+
+
+class MainWindow(QWidget):
+    """Top-level window holding the Sync and TTS tabs."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SubPlz")
+        self.resize(820, 720)
+        self.setAcceptDrops(True)
+
+        self.sync_tab = SyncTab()
+        self.tts_tab = TTSTab()
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.sync_tab, "Sync / Anki")
+        self.tabs.addTab(self.tts_tab, "Audiobook (TTS)")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self.tabs)
+        self.setLayout(layout)
 
 
 def main():

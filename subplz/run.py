@@ -14,6 +14,18 @@ from .auto.watcher import run_watcher
 from .auto.scanner import run_scanner
 
 
+def _run_tts(args):
+    # Lazy import: tts.py pulls in numpy/torch/SBV2, which we don't want
+    # to load for unrelated subcommands like `find` or `rename`.
+    from .tts import run_tts
+    return run_tts(args)
+
+
+def _run_voice(args):
+    from .tts import run_voice
+    return run_voice(args)
+
+
 def execute_on_inputs():
     """
     Parses CLI arguments, loads config, combines them, configures logging,
@@ -21,7 +33,8 @@ def execute_on_inputs():
     """
 
     args = get_args()
-    config = load_config(args.config)
+    # Some subcommands (tts, voice) don't expose --config; load defaults in that case.
+    config = load_config(getattr(args, "config", None))
     inputs = get_inputs(args, config)
     inputs.config_data = config
     configure_logging(config)
@@ -37,6 +50,8 @@ def execute_on_inputs():
         "sync": run_sync,
         "gen": run_gen,
         "srs": run_srs,
+        "tts": _run_tts,
+        "voice": _run_voice,
     }
 
     handler_function = COMMAND_MAP.get(inputs.subcommand)
