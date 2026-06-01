@@ -286,6 +286,7 @@ class SyncWorker(QObject):
             "--lang", self.opts["lang"],
             "--model", self.opts["model"],
             "--respect-grouping",
+            "--max-cue-length", str(self.opts.get("max_cue_length", 100)),
             "--overwrite",
             "--rerun",
         ]
@@ -539,6 +540,14 @@ class SyncTab(QWidget):
         self.lang_edit.setMaximumWidth(60)
         self.mlx_check = QCheckBox("Use MLX (Apple Metal + Neural Engine)")
         self.mlx_check.setChecked(True)
+        self.max_cue_spin = QSpinBox()
+        self.max_cue_spin.setRange(0, 400)
+        self.max_cue_spin.setValue(100)
+        self.max_cue_spin.setToolTip(
+            "Soft character limit per subtitle line. Long monologues/quotes over "
+            "~this are split at Japanese punctuation (。！？ preferred, then 、) into "
+            "roughly-equal lines. 0 disables."
+        )
 
         self.settings_sync = QGroupBox("Sync settings")
         sg = QHBoxLayout()
@@ -549,6 +558,9 @@ class SyncTab(QWidget):
         sg.addWidget(self.lang_edit)
         sg.addSpacing(20)
         sg.addWidget(self.mlx_check)
+        sg.addSpacing(20)
+        sg.addWidget(QLabel("Max line length:"))
+        sg.addWidget(self.max_cue_spin)
         sg.addStretch()
         self.settings_sync.setLayout(sg)
 
@@ -829,6 +841,7 @@ class SyncTab(QWidget):
             "model": self.model_combo.currentText(),
             "lang": self.lang_edit.text().strip() or "ja",
             "mlx": self.mlx_check.isChecked(),
+            "max_cue_length": self.max_cue_spin.value(),
         }
         if action in ("srs", "both"):
             # Validate pad/fade are integers and non-negative; fall back to defaults

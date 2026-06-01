@@ -3,6 +3,7 @@ from ats.main import Segment
 from .logger import logger
 from subplz.utils import get_tqdm, get_threads
 from subplz.align import shift_align
+from subplz.cue_split import split_long_segments
 from subplz.transcribe import transcribe
 from subplz.files import get_sources, post_process
 from subplz.models import get_model, get_temperature, unload_model
@@ -48,6 +49,9 @@ def gen(source, model, streams, be):
                 continue
 
     shifted_segments = shift_align(segments)
+    shifted_segments = split_long_segments(
+        shifted_segments, getattr(be, "max_cue_length", 120)
+    )
     source.writer.write_sub(shifted_segments, source.output_full_paths[ai])
 
 

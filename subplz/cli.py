@@ -341,6 +341,19 @@ ARGUMENTS = {
             ),
         },
     },
+    "max_cue_length": {
+        "flags": ["--max-cue-length"],
+        "kwargs": {
+            "type": int,
+            "default": 120,
+            "help": (
+                "Soft character limit per subtitle cue. Cues longer than ~this (e.g. "
+                "long monologues or quotes that are a single sentence) are split at "
+                "Japanese punctuation (。！？ preferred, then 、) into 2+ roughly-equal "
+                "cues, with timing interpolated by character count. Set 0 to disable."
+            ),
+        },
+    },
     "initial_prompt": {
         "flags": ["--initial-prompt"],
         "kwargs": {
@@ -626,6 +639,7 @@ class SyncParams:
     # Behavior
     respect_grouping: bool = field(metadata={"category": "optional"})
     respect_grouping_count: int = field(metadata={"category": "optional"})
+    max_cue_length: int = field(metadata={"category": "optional"})
     # General Whisper
     language: str = field(metadata={"category": "optional"})
     model_name: str = field(metadata={"category": "optional"})
@@ -718,6 +732,8 @@ class GenParams:
     device: str = field(metadata={"category": "optional"})
     # UI
     progress: bool = field(metadata={"category": "optional"})
+    # Behavior
+    max_cue_length: int = field(metadata={"category": "optional"})
     # General Whisper
     language: str = field(metadata={"category": "optional"})
     model_name: str = field(metadata={"category": "optional"})

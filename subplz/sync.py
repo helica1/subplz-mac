@@ -12,6 +12,7 @@ from subplz.alass import sync_alass
 from subplz.files import get_sources, post_process
 from subplz.models import get_model, get_temperature, unload_model
 from subplz.align import greedy_align, nc_align, shift_align
+from subplz.cue_split import split_long_segments
 from subplz.vad_snap import rebalance_skewed_neighbors, vad_snap_cues
 from subplz.files import sourceData
 from subplz.utils import get_tqdm, get_threads
@@ -169,8 +170,19 @@ def sync(source: sourceData, model, streams, be):
             if not segments:
                 continue
             shifted_segments = shift_align(segments)
-            source.writer.write_sub(shifted_segments, source.output_full_paths[ai])
-            if len(source.chapters) == 1 and be.respect_grouping:
+            do_grouping = len(source.chapters) == 1 and be.respect_grouping
+            # When grouping, this step-3 SRT is the input greedy_align re-times
+            # against, so write it un-split and split the final grouped result
+            # below. When not grouping, this IS the final output, so split here.
+            write_segments = (
+                shifted_segments
+                if do_grouping
+                else split_long_segments(
+                    shifted_segments, getattr(be, "max_cue_length", 120)
+                )
+            )
+            source.writer.write_sub(write_segments, source.output_full_paths[ai])
+            if do_grouping:
                 # greedy_align replaces nc_align: it walks the step-3 SRT in
                 # monotonic order and matches each script sentence to its
                 # best-fit sub by fuzzy ratio. Avoids the recursive matcher's
@@ -208,6 +220,9 @@ def sync(source: sourceData, model, streams, be):
                     audio_path = streams[ai][2][0].path
                     snapped = vad_snap_cues(new_segments, audio_path)
                     print(f"🎯 VAD snap: refined {snapped} cue boundaries")
+                new_segments = split_long_segments(
+                    new_segments, getattr(be, "max_cue_length", 120)
+                )
                 source.writer.write_sub(new_segments, source.output_full_paths[ai])
 
 
